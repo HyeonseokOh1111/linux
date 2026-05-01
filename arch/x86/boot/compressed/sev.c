@@ -204,10 +204,6 @@ void cleanup_lazy_validated_pages(void)
 		unsigned int size = lazy_validated_addresses[i].size;
 		unsigned int addr = lazy_validated_addresses[i].addr;
 
-		if(addr >= 0x1000000 && addr < 0x2800960) {
-			while(1) { asm("hlt"); }
-		}
-
 		// debug_putstr("lazy validated range: addr=0x");
 		// debug_puthex(addr & ~0xfff);
 		// debug_putstr(", size=0x");

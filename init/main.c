@@ -1501,8 +1501,6 @@ static int __ref kernel_init(void *unused)
 
 	do_sysctl_args();
 
-	outb(0x41, 0x80);
-
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);
 		if (!ret)

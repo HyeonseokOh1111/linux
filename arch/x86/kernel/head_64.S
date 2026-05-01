@@ -61,31 +61,6 @@ SYM_CODE_START_NOALIGN(startup_64)
 	 * tables and then reload them.
 	 */
 
-	movl       $0xC0010131, %ecx
-    rdmsr
-    bt        $1, %eax
-	jc		  sev_es_debug
-
-	movl	  $0x40, %eax
-	outb	  $0x80
-	jmp 	  sev_es_debug_end
-
-sev_es_debug:
-	# DEBUG signal entry point for
-	movl $0xC0010130, %ecx
-	xorl %eax, %eax
-	xorl %edx, %edx
-	movl $0x04, %edx
-    shl  $20, %edx
-	movl $0x14, %eax
-	wrmsr
-	vmgexit
-
-	xorl %eax, %eax
-	xorl %edx, %edx
-	xorl %ecx, %ecx
-sev_es_debug_end:
-
 	/* Set up the stack for verify_cpu() */
 	leaq	(__end_init_task - PTREGS_SIZE)(%rip), %rsp
 
