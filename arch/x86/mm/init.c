@@ -125,24 +125,34 @@ static bool __initdata can_use_brk_pgt = true;
 __ref void *alloc_low_pages(unsigned int num)
 {
 	unsigned long pfn;
+	phys_addr_t saved_limit = 0;
 	int i;
 
 	if (after_bootmem) {
 		unsigned int order;
 
 		order = get_order((unsigned long)num << PAGE_SHIFT);
-		return (void *)__get_free_pages(GFP_ATOMIC | __GFP_ZERO, order);
+		pfn = __get_free_pages(GFP_ATOMIC | __GFP_ZERO, order);
+		return (void *)pfn;
 	}
 
 	if ((pgt_buf_end + num) > pgt_buf_top || !can_use_brk_pgt) {
 		unsigned long ret = 0;
 
 		if (min_pfn_mapped < max_pfn_mapped) {
+			phys_addr_t alloc_end = max_pfn_mapped << PAGE_SHIFT;
+
+			saved_limit = memblock_get_current_limit();
+			if (alloc_end > saved_limit)
+				memblock_set_current_limit(alloc_end);
 			ret = memblock_phys_alloc_range(
 					PAGE_SIZE * num, PAGE_SIZE,
 					min_pfn_mapped << PAGE_SHIFT,
 					max_pfn_mapped << PAGE_SHIFT);
+			if (alloc_end > saved_limit)
+				memblock_set_current_limit(saved_limit);
 		}
+
 		if (!ret && can_use_brk_pgt)
 			ret = __pa(extend_brk(PAGE_SIZE * num, PAGE_SIZE));
 
@@ -555,12 +565,23 @@ unsigned long __ref init_memory_mapping(unsigned long start,
 	memset(mr, 0, sizeof(mr));
 	nr_range = split_mem_range(mr, 0, start, end);
 
-	for (i = 0; i < nr_range; i++)
-		ret = kernel_physical_mapping_init(mr[i].start, mr[i].end,
-						   mr[i].page_size_mask,
-						   prot);
-
-	add_pfn_range_mapped(start >> PAGE_SHIFT, ret >> PAGE_SHIFT);
+	if (!after_bootmem && !memblock_bottom_up()) {
+		for (i = nr_range - 1; i >= 0; i--) {
+			ret = kernel_physical_mapping_init(mr[i].start, mr[i].end,
+							   mr[i].page_size_mask,
+							   prot);
+			add_pfn_range_mapped(mr[i].start >> PAGE_SHIFT,
+					     ret >> PAGE_SHIFT);
+		}
+	} else {
+		for (i = 0; i < nr_range; i++) {
+			ret = kernel_physical_mapping_init(mr[i].start, mr[i].end,
+							   mr[i].page_size_mask,
+							   prot);
+			add_pfn_range_mapped(mr[i].start >> PAGE_SHIFT,
+					     ret >> PAGE_SHIFT);
+		}
+	}
 
 	return ret >> PAGE_SHIFT;
 }
@@ -625,6 +646,37 @@ static unsigned long __init get_new_step_size(unsigned long step_size)
 	return step_size << (PMD_SHIFT - PAGE_SHIFT - 1);
 }
 
+static void __init memory_map_bottom_up(unsigned long map_start,
+					unsigned long map_end);
+
+static unsigned long __init find_top_down_anchor_end(unsigned long map_start,
+						     unsigned long map_end)
+{
+	u64 i;
+	phys_addr_t range_start, range_end;
+
+	for_each_free_mem_range_reverse(i, NUMA_NO_NODE, MEMBLOCK_NONE,
+					 &range_start, &range_end, NULL) {
+		unsigned long start, end;
+
+		start = clamp_val(range_start, map_start, map_end);
+		end = clamp_val(range_end, map_start, map_end);
+
+		if (start >= end)
+			continue;
+
+		start = round_up(start, PMD_SIZE);
+		end = round_down(end, PMD_SIZE);
+
+		if (start >= end || end - start < PMD_SIZE)
+			continue;
+
+		return end;
+	}
+
+	return 0;
+}
+
 /**
  * memory_map_top_down - Map [map_start, map_end) top down
  * @map_start: start address of the target memory range
@@ -640,7 +692,6 @@ static void __init memory_map_top_down(unsigned long map_start,
 {
 	unsigned long real_end, last_start;
 	unsigned long step_size;
-	unsigned long addr;
 	unsigned long mapped_ram_size = 0;
 
 	/*
@@ -651,10 +702,36 @@ static void __init memory_map_top_down(unsigned long map_start,
 	 * there is enough mapped memory that can be allocated from
 	 * memblock.
 	 */
-	addr = memblock_phys_alloc_range(PMD_SIZE, PMD_SIZE, map_start,
-					 map_end);
-	memblock_phys_free(addr, PMD_SIZE);
-	real_end = addr + PMD_SIZE;
+	real_end = find_top_down_anchor_end(map_start, map_end);
+	if (!real_end) {
+		unsigned long kernel_end = clamp_val(__pa_symbol(_end), map_start, map_end);
+		unsigned long pgt_start = clamp_val((unsigned long)pgt_buf_start << PAGE_SHIFT,
+						    map_start, map_end);
+		unsigned long pgt_end = clamp_val((unsigned long)pgt_buf_top << PAGE_SHIFT,
+						  map_start, map_end);
+		unsigned long start, end;
+
+		start = max(pgt_end, map_start);
+		end = map_end;
+		if (start < end)
+			memory_map_bottom_up(start, end);
+
+		start = map_start;
+		end = min(kernel_end, map_end);
+		if (start < end)
+			memory_map_bottom_up(start, end);
+
+		start = max(kernel_end, map_start);
+		end = min(pgt_start, map_end);
+		if (start < end)
+			memory_map_bottom_up(start, end);
+
+		start = max(max(kernel_end, pgt_start), map_start);
+		end = min(pgt_end, map_end);
+		if (start < end)
+			memory_map_bottom_up(start, end);
+		return;
+	}
 
 	/* step_size need to be small so pgt_buf from BRK could cover it */
 	step_size = PMD_SIZE;

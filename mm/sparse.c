@@ -206,6 +206,14 @@ void __init subsection_map_init(unsigned long pfn, unsigned long nr_pages)
 		pfns = min(nr_pages, PAGES_PER_SECTION
 				- (pfn & ~PAGE_SECTION_MASK));
 		ms = __nr_to_section(nr);
+		if (!ms->usage) {
+			ms->usage = memblock_alloc(mem_section_usage_size(),
+						   SMP_CACHE_BYTES);
+			if (!ms->usage) {
+				panic("%s: failed to allocate usage for section %lu\n",
+				      __func__, nr);
+			}
+		}
 		subsection_mask_set(ms->usage->subsection_map, pfn, pfns);
 
 		pr_debug("%s: sec: %lu pfns: %lu set(%d, %d)\n", __func__, nr,
