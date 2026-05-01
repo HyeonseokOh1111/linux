@@ -17,6 +17,7 @@
 #include <linux/sched/smt.h>
 #include <linux/pgtable.h>
 #include <linux/bpf.h>
+#include <linux/cc_platform.h>
 
 #include <asm/spec-ctrl.h>
 #include <asm/cmdline.h>
@@ -206,7 +207,7 @@ void __init check_bugs(void)
 	 * Right now we don't do that with gbpages because there seems
 	 * very little benefit for that case.
 	 */
-	if (!direct_gbpages)
+	if (!direct_gbpages && !cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
 		set_memory_4k((unsigned long)__va(0), 1);
 #endif
 }
