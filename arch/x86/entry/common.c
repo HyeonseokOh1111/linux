@@ -30,6 +30,7 @@
 #include <asm/vdso.h>
 #include <asm/cpufeature.h>
 #include <asm/fpu/api.h>
+#include <asm/mem_encrypt.h>
 #include <asm/nospec-branch.h>
 #include <asm/io_bitmap.h>
 #include <asm/syscall.h>
@@ -251,6 +252,13 @@ SYSCALL_DEFINE0(ni_syscall)
 {
 	return -ENOSYS;
 }
+
+#ifdef CONFIG_X86_64
+SYSCALL_DEFINE0(snapshot_enter)
+{
+	return sev_snapshot_arm();
+}
+#endif
 
 #ifdef CONFIG_XEN_PV
 #ifndef CONFIG_PREEMPTION

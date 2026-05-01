@@ -23,6 +23,7 @@
 #include <linux/platform_device.h>
 #include <linux/io.h>
 #include <linux/psp-sev.h>
+#include <linux/swiotlb.h>
 #include <uapi/linux/sev-guest.h>
 
 #include <asm/cpu_entry_area.h>
@@ -40,6 +41,8 @@
 #include <asm/apic.h>
 #include <asm/cpuid.h>
 #include <asm/cmdline.h>
+
+#include "sev_snapshot.h"
 
 #define DR7_RESET_VALUE        0x400
 
@@ -123,6 +126,36 @@ struct sev_config {
 };
 
 static struct sev_config sev_cfg __read_mostly;
+
+void sev_snapshot_seed_known_shared_extents(void)
+{
+	unsigned long swiotlb_bytes;
+	int cpu;
+
+	if (!(sev_status & MSR_AMD64_SEV_SNP_ENABLED))
+		return;
+
+	for_each_possible_cpu(cpu) {
+		struct sev_es_runtime_data *data = per_cpu(runtime_data, cpu);
+
+		if (!data)
+			continue;
+
+		sev_snapshot_track_page_state_pa(__pa(&data->ghcb_page), 1,
+						 SNP_PAGE_STATE_SHARED);
+	}
+
+	if (!io_tlb_default_mem.nslabs || !io_tlb_default_mem.vaddr)
+		return;
+
+	swiotlb_bytes = PAGE_ALIGN(io_tlb_default_mem.nslabs << IO_TLB_SHIFT);
+	if (!swiotlb_bytes)
+		return;
+
+	sev_snapshot_track_page_state_pa(io_tlb_default_mem.start,
+					 swiotlb_bytes >> PAGE_SHIFT,
+					 SNP_PAGE_STATE_SHARED);
+}
 
 static __always_inline bool on_vc_stack(struct pt_regs *regs)
 {
@@ -645,6 +678,66 @@ static u64 __init get_jump_table_addr(void)
 	return ret;
 }
 
+int sev_es_ghcb_vmmcall_rax(u64 rax)
+{
+	struct ghcb_state state;
+	struct es_em_ctxt ctxt = {};
+	unsigned long flags;
+	struct ghcb *ghcb;
+	enum es_result res;
+	int ret = -EIO;
+
+	local_irq_save(flags);
+
+	ghcb = __sev_get_ghcb(&state);
+	if (!ghcb)
+		goto out_restore_irq;
+
+	vc_ghcb_invalidate(ghcb);
+	ghcb_set_rax(ghcb, rax);
+	ghcb_set_cpl(ghcb, 0);
+
+	res = sev_es_ghcb_hv_call(ghcb, &ctxt, SVM_EXIT_VMMCALL, 0, 0);
+	if (res != ES_OK)
+		goto out_put;
+
+	if (!ghcb_rax_is_valid(ghcb))
+		goto out_put;
+
+	ret = ghcb->save.rax;
+
+out_put:
+	__sev_put_ghcb(&state);
+out_restore_irq:
+	local_irq_restore(flags);
+	return ret;
+}
+
+int sev_es_ghcb_msr_signal(u64 val)
+{
+	struct ghcb_state state;
+	unsigned long flags;
+	struct ghcb *ghcb;
+	int ret = -EIO;
+
+	local_irq_save(flags);
+
+	ghcb = __sev_get_ghcb(&state);
+	if (!ghcb)
+		goto out_restore_irq;
+
+	vc_ghcb_invalidate(ghcb);
+	sev_es_wr_ghcb_msr(val);
+	VMGEXIT();
+	sev_es_wr_ghcb_msr(__pa(ghcb));
+	ret = 0;
+
+	__sev_put_ghcb(&state);
+out_restore_irq:
+	local_irq_restore(flags);
+	return ret;
+}
+
 static void pvalidate_pages(unsigned long vaddr, unsigned int npages, bool validate)
 {
 	unsigned long vaddr_end;
@@ -911,6 +1004,7 @@ void snp_set_memory_shared(unsigned long vaddr, unsigned int npages)
 	pvalidate_pages(vaddr, npages, false);
 
 	set_pages_state(vaddr, npages, SNP_PAGE_STATE_SHARED);
+	sev_snapshot_track_page_state(vaddr, npages, SNP_PAGE_STATE_SHARED);
 
 }
 
@@ -922,6 +1016,7 @@ void snp_set_memory_private(unsigned long vaddr, unsigned int npages)
 	set_pages_state(vaddr, npages, SNP_PAGE_STATE_PRIVATE);
 
 	pvalidate_pages(vaddr, npages, true);
+	sev_snapshot_track_page_state(vaddr, npages, SNP_PAGE_STATE_PRIVATE);
 }
 
 static int snp_set_vmsa(void *va, bool vmsa)
@@ -1243,8 +1338,96 @@ static void snp_register_per_cpu_ghcb(void)
 
 	data = this_cpu_read(runtime_data);
 	ghcb = &data->ghcb_page;
-
 	snp_register_ghcb_early(__pa(ghcb));
+}
+
+static void snp_register_snapshot_boot_ghcb(void)
+{
+	struct sev_es_runtime_data *data;
+	struct ghcb *ghcb;
+	unsigned long paddr, pfn;
+	u64 req, val;
+
+	/*
+	 * Snapshot restore resumes on the boot vCPU before the restored
+	 * per-CPU GS base is fully reinstated, so do not rely on
+	 * this_cpu_read(runtime_data) here.
+	 */
+	data = per_cpu(runtime_data, 0);
+	ghcb = &data->ghcb_page;
+	paddr = __pa(ghcb);
+	pfn = paddr >> PAGE_SHIFT;
+	req = GHCB_MSR_REG_GPA_REQ_VAL(pfn);
+
+	sev_es_wr_ghcb_msr(req);
+	VMGEXIT();
+
+	val = sev_es_rd_ghcb_msr();
+
+	if ((GHCB_RESP_CODE(val) != GHCB_MSR_REG_GPA_RESP) ||
+	    (GHCB_MSR_REG_GPA_RESP_VAL(val) != pfn))
+		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_REGISTER);
+}
+
+void sev_snapshot_register_runtime_ghcb(void)
+{
+	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
+		return;
+
+	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
+		return;
+
+	snp_register_snapshot_boot_ghcb();
+}
+
+bool sev_snapshot_negotiate_runtime_ghcb_protocol(void)
+{
+	u64 val;
+	u16 current_version;
+	u16 negotiated_version;
+
+	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
+		return true;
+
+	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
+		return true;
+
+	sev_es_wr_ghcb_msr(GHCB_MSR_SEV_INFO_REQ);
+	VMGEXIT();
+
+	val = sev_es_rd_ghcb_msr();
+
+	if (GHCB_MSR_INFO(val) != GHCB_MSR_SEV_INFO_RESP)
+		return false;
+
+	if (GHCB_MSR_PROTO_MAX(val) < GHCB_PROTOCOL_MIN ||
+	    GHCB_MSR_PROTO_MIN(val) > GHCB_PROTOCOL_MAX)
+		return false;
+
+	negotiated_version =
+		min_t(size_t, GHCB_MSR_PROTO_MAX(val), GHCB_PROTOCOL_MAX);
+	current_version = READ_ONCE(ghcb_version);
+	if (!current_version)
+		return false;
+
+	return true;
+}
+
+u64 sev_snapshot_runtime_ghcb_pa(void)
+{
+	struct sev_es_runtime_data *data;
+
+	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
+		return 0;
+
+	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
+		return 0;
+
+	data = this_cpu_read(runtime_data);
+	if (!data)
+		return 0;
+
+	return __pa(&data->ghcb_page);
 }
 
 void setup_ghcb(void)
@@ -1267,7 +1450,6 @@ void setup_ghcb(void)
 	if (initial_vc_handler == (unsigned long)kernel_exc_vmm_communication) {
 		if (cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
 			snp_register_per_cpu_ghcb();
-
 		return;
 	}
 

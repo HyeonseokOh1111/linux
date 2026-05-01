@@ -44,6 +44,7 @@
 #include <asm/kasan.h>
 #include <asm/kaslr.h>
 #include <asm/mce.h>
+#include <asm/mem_encrypt.h>
 #include <asm/memtype.h>
 #include <asm/mtrr.h>
 #include <asm/realmode.h>
@@ -795,6 +796,7 @@ static void __init early_reserve_memory(void)
 	early_reserve_initrd();
 
 	memblock_x86_reserve_range_setup_data();
+	sev_mailbox_reserve_from_setup_data(&boot_params);
 
 	reserve_ibft_region();
 	reserve_bios_regions();
