@@ -23,6 +23,7 @@
 #include <linux/syscore_ops.h>
 #include <linux/pgtable.h>
 #include <linux/stackprotector.h>
+#include <linux/cc_platform.h>
 
 #include <asm/cmdline.h>
 #include <asm/perf_event.h>
@@ -2141,9 +2142,6 @@ static inline void setup_getcpu(int cpu)
 	unsigned long cpudata = vdso_encode_cpunode(cpu, early_cpu_to_node(cpu));
 	struct desc_struct d = { };
 
-	if (boot_cpu_has(X86_FEATURE_RDTSCP) || boot_cpu_has(X86_FEATURE_RDPID))
-		wrmsr(MSR_TSC_AUX, cpudata, 0);
-
 	/* Store CPU and node number in limit. */
 	d.limit0 = cpudata;
 	d.limit1 = cpudata >> 16;
@@ -2155,6 +2153,17 @@ static inline void setup_getcpu(int cpu)
 	d.d = 1;		/* 32-bit */
 
 	write_gdt_entry(get_cpu_gdt_rw(cpu), GDT_ENTRY_CPUNODE, &d, DESCTYPE_S);
+}
+
+static inline void setup_getcpu_msr(int cpu)
+{
+	unsigned long cpudata = vdso_encode_cpunode(cpu, early_cpu_to_node(cpu));
+
+	if (boot_cpu_has(X86_FEATURE_RDTSCP) || boot_cpu_has(X86_FEATURE_RDPID)) {
+		if (cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
+			return;
+		wrmsr(MSR_TSC_AUX, cpudata, 0);
+	}
 }
 
 #ifdef CONFIG_X86_64
@@ -2226,6 +2235,12 @@ void cpu_init_exception_handling(void)
 
 	/* Finally load the IDT */
 	load_current_idt();
+
+	/*
+	 * Writing MSR_TSC_AUX can trigger a #VC under SNP. Do it only after the
+	 * runtime GHCB, TSS, and IDT are all live so the exception path is ready.
+	 */
+	setup_getcpu_msr(cpu);
 }
 
 /*
