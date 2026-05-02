@@ -63,11 +63,7 @@
 #define SEV_SNAPSHOT_CONTROL_SHARED_SIZE	SZ_2M
 #define SEV_SNAPSHOT_ATTESTATION_REQUEST_OFFSET \
 	(SEV_SNAPSHOT_CONTROL_SHARED_SIZE - (2 * PAGE_SIZE))
-#define SEV_SNAPSHOT_RESTORE_SCRATCH_SLOT_COUNT	8U
-#define SEV_SNAPSHOT_RESTORE_SHARED_SCRATCH_OFFSET	0x0E00ULL
 #define SEV_SNAPSHOT_RESTORE_SHARED_BRIDGE_L2E_OFFSET	0x0E40ULL
-#define SEV_SNAPSHOT_RESTORE_BRIDGE_ENTRY_PAGE_DELTA	0x4000ULL
-#define SEV_SNAPSHOT_RESTORE_BRIDGE_REQUEST_PAGE_DELTA	0x9000ULL
 #define SEV_SNAPSHOT_REQUEST_HOST_EVENT_SIGNAL	0x0051000000000014ULL
 
 #define SEV_SNAPSHOT_SHARED_EXTENT_MAX \
@@ -85,7 +81,6 @@ static bool sev_snapshot_shared_ready;
 static bool sev_snapshot_mailbox_accepted;
 static struct task_struct *sev_snapshot_pending_task;
 static void *sev_snapshot_attestation_request_page_va;
-u32 *sev_snapshot_restore_scratch_va;
 u64 *sev_snapshot_restore_bridge_l2e_va;
 static bool sev_snapshot_warned_extent_capacity;
 bool sev_snapshot_resume_in_progress;
@@ -106,68 +101,6 @@ static __always_inline struct sev_snapshot_mailbox *sev_snapshot_mailbox_va(void
 static __always_inline struct sev_snapshot_mailbox *sev_snapshot_restore_mailbox_va(void)
 {
 	return __va(SEV_SNAPSHOT_FIXED_MAILBOX_PA);
-}
-
-static __always_inline void *
-sev_snapshot_restore_entry_alias(struct sev_snapshot_restore_entry_record *entry_record,
-				 u64 delta)
-{
-	u8 *restore_stub_page;
-
-	if (!entry_record)
-		return NULL;
-
-	restore_stub_page =
-		(u8 *)entry_record - SEV_SNAPSHOT_RESTORE_BRIDGE_ENTRY_PAGE_DELTA;
-	return restore_stub_page + delta;
-}
-
-static __always_inline u32 *
-sev_snapshot_restore_scratch_alias(struct sev_snapshot_restore_entry_record *entry_record)
-{
-	u8 *request_page = sev_snapshot_restore_entry_alias(
-		entry_record, SEV_SNAPSHOT_RESTORE_BRIDGE_REQUEST_PAGE_DELTA);
-
-	if (!request_page)
-		return NULL;
-
-	return (u32 *)(request_page + SEV_SNAPSHOT_RESTORE_SHARED_SCRATCH_OFFSET);
-}
-
-static __always_inline void
-sev_snapshot_store_restore_scratch_direct(u32 *scratch, u32 slot, u32 value)
-{
-	if (!scratch)
-		return;
-
-	if (slot >= SEV_SNAPSHOT_RESTORE_SCRATCH_SLOT_COUNT)
-		return;
-
-	WRITE_ONCE(scratch[slot], value);
-}
-
-static __always_inline void
-sev_snapshot_seed_restore_transport_aliases(
-	struct sev_snapshot_restore_entry_record *entry_record)
-{
-	u8 *restore_stub_page;
-	u8 *request_page;
-
-	if (!entry_record)
-		return;
-
-	restore_stub_page =
-		(u8 *)entry_record - SEV_SNAPSHOT_RESTORE_BRIDGE_ENTRY_PAGE_DELTA;
-	request_page =
-		restore_stub_page + SEV_SNAPSHOT_RESTORE_BRIDGE_REQUEST_PAGE_DELTA;
-
-	WRITE_ONCE(sev_snapshot_attestation_request_page_va, request_page);
-	WRITE_ONCE(sev_snapshot_restore_scratch_va,
-		   (u32 *)(request_page +
-			   SEV_SNAPSHOT_RESTORE_SHARED_SCRATCH_OFFSET));
-	WRITE_ONCE(sev_snapshot_restore_bridge_l2e_va,
-		   (u64 *)(request_page +
-			   SEV_SNAPSHOT_RESTORE_SHARED_BRIDGE_L2E_OFFSET));
 }
 
 static void sev_snapshot_install_sp0_scratch_stack(void)
@@ -433,9 +366,6 @@ static void sev_snapshot_map_request_page_locked(void)
 	if (!sev_snapshot_attestation_request_page_va)
 		return;
 
-	sev_snapshot_restore_scratch_va =
-		(u32 *)((u8 *)sev_snapshot_attestation_request_page_va +
-			SEV_SNAPSHOT_RESTORE_SHARED_SCRATCH_OFFSET);
 	sev_snapshot_restore_bridge_l2e_va =
 		(u64 *)((u8 *)sev_snapshot_attestation_request_page_va +
 			SEV_SNAPSHOT_RESTORE_SHARED_BRIDGE_L2E_OFFSET);
@@ -699,96 +629,31 @@ static __always_inline struct x86_hw_tss *sev_snapshot_restore_cpu0_tss_va(void)
 }
 
 static void sev_snapshot_prepare_restore_gdt(
-	struct sev_snapshot_mailbox *mailbox,
 	const struct sev_snapshot_cpu_context *ctx,
-	struct desc_ptr *gdt_desc,
-	u64 *tss_desc_lo,
-	u32 *restore_scratch)
+	struct desc_ptr *gdt_desc)
 {
 	struct ldttss_desc *tss;
 	struct x86_hw_tss *live_tss;
 	size_t gdt_size, tss_offset;
-	u64 first_gdt_qword;
 	void *gdt_base;
-
-	(void)mailbox;
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA013U);
-	barrier();
 
 	gdt_size = (size_t)ctx->gdt_desc.size + 1;
 	tss_offset = (size_t)(ctx->tss & ~0x7);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 1,
-						  (u32)gdt_size);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 2,
-						  (u32)tss_offset);
-	sev_snapshot_store_restore_scratch_direct(
-		restore_scratch, 3, (u32)ctx->gdt_desc.address);
-	sev_snapshot_store_restore_scratch_direct(
-		restore_scratch, 4, (u32)(ctx->gdt_desc.address >> 32));
-	barrier();
 
-	if (!ctx->gdt_desc.address || !gdt_size) {
-		sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-							  0xA0F1U);
+	if (!ctx->gdt_desc.address || !gdt_size)
 		sev_snapshot_restore_fault();
-	}
 
-	if (tss_offset + sizeof(*tss) > gdt_size) {
-		sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-							  0xA0F2U);
+	if (tss_offset + sizeof(*tss) > gdt_size)
 		sev_snapshot_restore_fault();
-	}
 
 	if (gdt_size > sizeof(ctx->gdt_copy) ||
-	    gdt_size > sizeof(sev_snapshot_restore_gdt_page)) {
-		sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-							  0xA0F4U);
+	    gdt_size > sizeof(sev_snapshot_restore_gdt_page))
 		sev_snapshot_restore_fault();
-	}
-
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA014U);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 5,
-						  (u32)(unsigned long)ctx->gdt_copy);
-	sev_snapshot_store_restore_scratch_direct(
-		restore_scratch, 6,
-		(u32)((unsigned long)ctx->gdt_copy >> 32));
-	barrier();
-
-	first_gdt_qword = READ_ONCE(*(const u64 *)ctx->gdt_copy);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA015U);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 5,
-						  (u32)first_gdt_qword);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 6,
-						  (u32)(first_gdt_qword >> 32));
-	barrier();
 
 	gdt_base = sev_snapshot_restore_gdt_page;
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA016U);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 5,
-						  (u32)(unsigned long)gdt_base);
-	sev_snapshot_store_restore_scratch_direct(
-		restore_scratch, 6, (u32)((unsigned long)gdt_base >> 32));
-	barrier();
-
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA017U);
-	barrier();
 	memcpy(gdt_base, ctx->gdt_copy, gdt_size);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA018U);
-	barrier();
 
 	tss = (struct ldttss_desc *)((u8 *)gdt_base + tss_offset);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 5,
-						  (u32)(unsigned long)tss);
-	sev_snapshot_store_restore_scratch_direct(
-		restore_scratch, 6, (u32)((unsigned long)tss >> 32));
-	barrier();
-
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA019U);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 5,
-						  (u32)(unsigned long)tss);
-	sev_snapshot_store_restore_scratch_direct(
-		restore_scratch, 6, (u32)((unsigned long)tss >> 32));
-	barrier();
 
 	/*
 	 * Keep the final GDTR on a kernel-owned page that remains mapped after
@@ -798,23 +663,9 @@ static void sev_snapshot_prepare_restore_gdt(
 	live_tss = sev_snapshot_restore_cpu0_tss_va();
 	set_tssldt_descriptor(tss, (unsigned long)live_tss, DESC_TSS,
 			      __KERNEL_TSS_LIMIT);
-	if (tss_desc_lo)
-		*tss_desc_lo = READ_ONCE(*(u64 *)tss);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA01AU);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 5,
-						  (u32)*tss_desc_lo);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 6,
-						  (u32)(*tss_desc_lo >> 32));
-	barrier();
 
 	gdt_desc->size = ctx->gdt_desc.size;
 	gdt_desc->address = (unsigned long)gdt_base;
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA01BU);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 5,
-						  (u32)gdt_desc->address);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 6,
-						  (u32)(gdt_desc->address >> 32));
-	barrier();
 }
 
 static void sev_snapshot_restore_tr_from_gdt(const struct desc_ptr *gdt_desc,
@@ -824,6 +675,22 @@ static void sev_snapshot_restore_tr_from_gdt(const struct desc_ptr *gdt_desc,
 		sev_snapshot_restore_fault();
 
 	asm volatile("ltr %0" : : "m" (restore_tss));
+}
+
+static void sev_snapshot_prefault_user_stack(const struct pt_regs *regs)
+{
+	u64 user_rsp;
+
+	if (!regs)
+		return;
+
+	user_rsp = regs->sp;
+	if (!user_rsp)
+		return;
+
+	stac();
+	(void)READ_ONCE(*(u64 *)(unsigned long)user_rsp);
+	clac();
 }
 
 static __always_inline void sev_snapshot_reload_kernel_cs(void)
@@ -840,57 +707,26 @@ static __always_inline void sev_snapshot_reload_kernel_cs(void)
 
 void __noreturn sev_snapshot_restore_from_mailbox(
 	struct sev_snapshot_mailbox *mailbox,
-	struct sev_snapshot_restore_entry_record *entry_record)
+	u64 *bridge_l2e_record)
 {
 	struct sev_snapshot_cpu_context *ctx;
 	struct desc_ptr restore_gdt_desc;
 	struct pt_regs *regs;
-	u32 *restore_scratch;
-	u64 post_copy_rsp = 0;
-	u64 post_copy_ret_target = 0;
-	u64 pre_resume_rsp = 0;
-	u64 pre_resume_ret_target = 0;
-	u64 tss_desc_lo = 0;
 	volatile u16 restore_ds, restore_es, restore_fs, restore_gs, restore_tss;
-
-	restore_scratch = sev_snapshot_restore_scratch_alias(entry_record);
-
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-						  0xe601000bU);
-	barrier();
 
 	if (!mailbox)
 		sev_snapshot_restore_fault();
 
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-						  0xe601000dU);
-	barrier();
-
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-						  0xe601000cU);
-	barrier();
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-						  0xb1770002U);
-	barrier();
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-						  0xb1770003U);
-	barrier();
+	(void)bridge_l2e_record;
 
 	ctx = &mailbox->cpu_ctx;
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA001U);
-	barrier();
 	restore_ds = READ_ONCE(ctx->ds);
 	restore_es = READ_ONCE(ctx->es);
 	restore_fs = READ_ONCE(ctx->fs);
 	restore_gs = READ_ONCE(ctx->gs);
 	restore_tss = READ_ONCE(ctx->tss);
 
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 5, 0xA006U);
-	barrier();
-
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA010U);
-	sev_snapshot_prepare_restore_gdt(mailbox, ctx, &restore_gdt_desc,
-					 &tss_desc_lo, restore_scratch);
+	sev_snapshot_prepare_restore_gdt(ctx, &restore_gdt_desc);
 	load_gdt(&restore_gdt_desc);
 	sev_snapshot_reload_kernel_cs();
 	asm volatile("movw %[ds], %%ss\n\t"
@@ -899,49 +735,21 @@ void __noreturn sev_snapshot_restore_from_mailbox(
 		     :
 		     : [ds] "r" ((__u16)__KERNEL_DS)
 		     : "memory");
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA011U);
-	barrier();
 
 	load_idt(&ctx->idt);
 	sev_snapshot_restore_tr_from_gdt(&restore_gdt_desc, restore_tss);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xA012U);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 6,
-						  (u32)tss_desc_lo);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 7,
-						  (u32)(tss_desc_lo >> 32));
-	barrier();
-
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-						  0xb1770004U);
-	barrier();
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-						  0xb1770005U);
-	barrier();
 
 	regs = (struct pt_regs *)(unsigned long)ctx->kernel_regs_ptr;
 	memcpy(regs, &ctx->regs, sizeof(*regs));
 	regs->flags &= ~X86_EFLAGS_TF;
 
 	write_cr0(ctx->cr0);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 1, 0xA002U);
-	barrier();
 	write_cr2(ctx->cr2);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 2, 0xA003U);
-	barrier();
 	wrmsrl(MSR_EFER, ctx->efer);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 4, 0xA005U);
-	barrier();
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-						  0xb1770006U);
-	barrier();
 
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 6, 0xB600);
 	sev_snapshot_register_runtime_ghcb();
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 6, 0xB6AA);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 6, 0xB700);
 	if (!sev_snapshot_negotiate_runtime_ghcb_protocol())
 		sev_snapshot_restore_fault();
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 6, 0xB7AA);
 
 	wrmsrl(MSR_FS_BASE, ctx->fs_base);
 	wrmsrl(MSR_GS_BASE, ctx->kernel_gs_base);
@@ -951,44 +759,11 @@ void __noreturn sev_snapshot_restore_from_mailbox(
 
 	sev_snapshot_restore_xsave_state(ctx);
 
-	post_copy_rsp = regs->sp;
-	if (post_copy_rsp) {
-		stac();
-		post_copy_ret_target = READ_ONCE(*(u64 *)(unsigned long)post_copy_rsp);
-		clac();
-	}
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0, 0xC101);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 1,
-						  (u32)post_copy_ret_target);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 2,
-						  (u32)(post_copy_ret_target >> 32));
+	sev_snapshot_prefault_user_stack(regs);
 	sev_snapshot_install_sp0_scratch_stack();
+	sev_snapshot_prefault_user_stack(regs);
 
-	pre_resume_rsp = regs->sp;
-	if (pre_resume_rsp) {
-		stac();
-		pre_resume_ret_target =
-			READ_ONCE(*(u64 *)(unsigned long)pre_resume_rsp);
-		clac();
-	}
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 3, 0xC201);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 4,
-						  (u32)pre_resume_ret_target);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 5,
-						  (u32)(pre_resume_ret_target >> 32));
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 6,
-						  (u32)pre_resume_rsp);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 7,
-						  (u32)(pre_resume_rsp >> 32));
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-						  0xA040U);
-	barrier();
 	native_write_cr4(ctx->cr4);
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 3, 0xA004U);
-	barrier();
-	sev_snapshot_store_restore_scratch_direct(restore_scratch, 0,
-						  0xb1770007U);
-	barrier();
 
 	sev_snapshot_resume_from_ptregs(regs);
 	unreachable();

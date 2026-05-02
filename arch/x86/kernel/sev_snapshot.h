@@ -24,8 +24,6 @@ struct sev_snapshot_shared_extent {
 	u64 npages;
 };
 
-struct sev_snapshot_restore_entry_record;
-
 struct sev_snapshot_cpu_context {
 	u32 context_size;
 	u32 valid_flags;
@@ -91,7 +89,7 @@ static_assert(sizeof(struct sev_snapshot_cpu_context) == 0x11e8);
 
 extern void sev_snapshot_restore_entry_early(struct sev_snapshot_mailbox *mailbox);
 extern void sev_snapshot_restore_from_mailbox(struct sev_snapshot_mailbox *mailbox,
-					      struct sev_snapshot_restore_entry_record *entry_record);
+					      u64 *bridge_l2e_record);
 extern void sev_snapshot_resume_from_ptregs(struct pt_regs *regs);
 
 void sev_snapshot_seed_known_shared_extents(void);
