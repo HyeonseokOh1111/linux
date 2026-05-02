@@ -57,8 +57,9 @@
 
 #include "sev_snapshot.h"
 
-#define SEV_SNAPSHOT_MAILBOX_SIZE		SZ_1M
-#define SEV_SNAPSHOT_FIXED_MAILBOX_PA		0x09100000ULL
+#define SEV_SNAPSHOT_MAILBOX_SIZE		SZ_2M
+#define SEV_SNAPSHOT_FIXED_MAILBOX_PA		0x00600000ULL
+#define SEV_SNAPSHOT_CONTROL_SHARED_PA		0x00200000ULL
 #define SEV_SNAPSHOT_CONTROL_SHARED_SIZE	SZ_2M
 #define SEV_SNAPSHOT_ATTESTATION_REQUEST_OFFSET \
 	(SEV_SNAPSHOT_CONTROL_SHARED_SIZE - (2 * PAGE_SIZE))
@@ -197,17 +198,14 @@ static bool __init sev_snapshot_range_is_ram(u64 start, u64 size)
 
 static phys_addr_t sev_snapshot_transport_page_pa(u64 offset)
 {
-	phys_addr_t control_shared_pa;
-
 	if (!sev_snapshot_mailbox_pa || !sev_snapshot_mailbox_len)
 		return 0;
 
-	control_shared_pa = sev_snapshot_mailbox_pa + sev_snapshot_mailbox_len;
 	if (offset > SEV_SNAPSHOT_CONTROL_SHARED_SIZE ||
 	    PAGE_SIZE > SEV_SNAPSHOT_CONTROL_SHARED_SIZE - offset)
 		return 0;
 
-	return control_shared_pa + offset;
+	return SEV_SNAPSHOT_CONTROL_SHARED_PA + offset;
 }
 
 static void sev_snapshot_accept_mailbox(void)
