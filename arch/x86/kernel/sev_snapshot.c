@@ -27,6 +27,7 @@
 #include <linux/uaccess.h>
 
 #include <asm/current.h>
+#include <asm/cacheflush.h>
 #include <asm/cpu_entry_area.h>
 #include <asm/desc.h>
 #include <asm/e820/api.h>
@@ -59,15 +60,12 @@
 #define SEV_SNAPSHOT_MAILBOX_SIZE		SZ_1M
 #define SEV_SNAPSHOT_FIXED_MAILBOX_PA		0x09100000ULL
 #define SEV_SNAPSHOT_CONTROL_SHARED_SIZE	SZ_2M
-#define SEV_SNAPSHOT_CONTROL_BLOCK_OFFSET	PAGE_SIZE
-#define SEV_SNAPSHOT_CONTROL_OPERATION_SNAPSHOT_REQUEST 0x03U
 #define SEV_SNAPSHOT_ATTESTATION_REQUEST_OFFSET \
 	(SEV_SNAPSHOT_CONTROL_SHARED_SIZE - (2 * PAGE_SIZE))
 #define SEV_SNAPSHOT_RESTORE_SCRATCH_SLOT_COUNT	8U
 #define SEV_SNAPSHOT_RESTORE_SHARED_SCRATCH_OFFSET	0x0E00ULL
 #define SEV_SNAPSHOT_RESTORE_SHARED_BRIDGE_L2E_OFFSET	0x0E40ULL
 #define SEV_SNAPSHOT_RESTORE_BRIDGE_ENTRY_PAGE_DELTA	0x4000ULL
-#define SEV_SNAPSHOT_RESTORE_BRIDGE_CONTROL_PAGE_DELTA	0x8000ULL
 #define SEV_SNAPSHOT_RESTORE_BRIDGE_REQUEST_PAGE_DELTA	0x9000ULL
 #define SEV_SNAPSHOT_REQUEST_HOST_EVENT_SIGNAL	0x0051000000000014ULL
 
@@ -86,7 +84,6 @@ static bool sev_snapshot_shared_ready;
 static bool sev_snapshot_mailbox_accepted;
 static struct task_struct *sev_snapshot_pending_task;
 static void *sev_snapshot_attestation_request_page_va;
-static u8 *sev_snapshot_control_block_va;
 u32 *sev_snapshot_restore_scratch_va;
 u64 *sev_snapshot_restore_bridge_l2e_va;
 static bool sev_snapshot_warned_extent_capacity;
@@ -163,9 +160,6 @@ sev_snapshot_seed_restore_transport_aliases(
 	request_page =
 		restore_stub_page + SEV_SNAPSHOT_RESTORE_BRIDGE_REQUEST_PAGE_DELTA;
 
-	WRITE_ONCE(sev_snapshot_control_block_va,
-		   restore_stub_page +
-		   SEV_SNAPSHOT_RESTORE_BRIDGE_CONTROL_PAGE_DELTA);
 	WRITE_ONCE(sev_snapshot_attestation_request_page_va, request_page);
 	WRITE_ONCE(sev_snapshot_restore_scratch_va,
 		   (u32 *)(request_page +
@@ -203,14 +197,17 @@ static bool __init sev_snapshot_range_is_ram(u64 start, u64 size)
 
 static phys_addr_t sev_snapshot_transport_page_pa(u64 offset)
 {
+	phys_addr_t control_shared_pa;
+
 	if (!sev_snapshot_mailbox_pa || !sev_snapshot_mailbox_len)
 		return 0;
 
-	if (offset > sev_snapshot_mailbox_len ||
-	    PAGE_SIZE > sev_snapshot_mailbox_len - offset)
+	control_shared_pa = sev_snapshot_mailbox_pa + sev_snapshot_mailbox_len;
+	if (offset > SEV_SNAPSHOT_CONTROL_SHARED_SIZE ||
+	    PAGE_SIZE > SEV_SNAPSHOT_CONTROL_SHARED_SIZE - offset)
 		return 0;
 
-	return sev_snapshot_mailbox_pa + offset;
+	return control_shared_pa + offset;
 }
 
 static void sev_snapshot_accept_mailbox(void)
@@ -239,18 +236,10 @@ static int sev_snapshot_map_transport_pages(void)
 		return -ENODEV;
 
 	mutex_lock(&sev_snapshot_transport_lock);
-
-	if (READ_ONCE(sev_snapshot_control_block_va))
-		goto out_unlock;
-
-	sev_snapshot_control_block_va =
-		(u8 *)sev_snapshot_mailbox_va() + SEV_SNAPSHOT_CONTROL_BLOCK_OFFSET;
 	sev_snapshot_map_request_page_locked();
-
-out_unlock:
 	mutex_unlock(&sev_snapshot_transport_lock);
 
-	if (!READ_ONCE(sev_snapshot_control_block_va))
+	if (!READ_ONCE(sev_snapshot_attestation_request_page_va))
 		return -ENOMEM;
 
 	return 0;
@@ -419,7 +408,7 @@ out_unlock:
 
 	if (cc_platform_has(CC_ATTR_GUEST_SEV_SNP)) {
 		start = ALIGN_DOWN((u64)__pa(__start_bss_decrypted), PAGE_SIZE);
-		end = ALIGN((u64)__pa(__end_bss_decrypted), PAGE_SIZE);
+		end = ALIGN((u64)__pa(__start_bss_decrypted_unused), PAGE_SIZE);
 		if (start < end)
 			sev_snapshot_track_page_state_pa(start,
 							 (end - start) >> PAGE_SHIFT,
@@ -579,6 +568,22 @@ static void __noreturn sev_snapshot_spin_after_capture(void)
 		asm volatile("pause" ::: "memory");
 }
 
+static int sev_snapshot_signal_host_capture(void)
+{
+	unsigned long flags;
+	u64 ghcb_msr;
+
+	local_irq_save(flags);
+	ghcb_msr = __rdmsr(MSR_AMD64_SEV_ES_GHCB);
+	native_wrmsrl(MSR_AMD64_SEV_ES_GHCB,
+		      SEV_SNAPSHOT_REQUEST_HOST_EVENT_SIGNAL);
+	VMGEXIT();
+	native_wrmsrl(MSR_AMD64_SEV_ES_GHCB, ghcb_msr);
+	local_irq_restore(flags);
+
+	return 0;
+}
+
 static int sev_snapshot_prepare_capture(void)
 {
 	struct sev_snapshot_mailbox *mailbox;
@@ -602,6 +607,7 @@ static int sev_snapshot_prepare_capture(void)
 static long sev_snapshot_capture_final(const struct pt_regs *regs)
 {
 	struct sev_snapshot_mailbox *mailbox;
+	long ret;
 
 	if (!regs)
 		return -EINVAL;
@@ -614,13 +620,13 @@ static long sev_snapshot_capture_final(const struct pt_regs *regs)
 	sev_snapshot_fill_context(&mailbox->cpu_ctx, regs);
 	sev_snapshot_rebuild_shared_extents_from_direct_map();
 	sev_snapshot_flush_shared_extents(mailbox);
+	clflush_cache_range(mailbox, SEV_SNAPSHOT_MAILBOX_SIZE);
 	wmb();
-	if (!sev_snapshot_control_block_va)
-		return -ENODEV;
 
-	WRITE_ONCE(*sev_snapshot_control_block_va,
-		   SEV_SNAPSHOT_CONTROL_OPERATION_SNAPSHOT_REQUEST);
-	wmb();
+	ret = sev_snapshot_signal_host_capture();
+	if (ret)
+		return ret;
+
 	sev_snapshot_spin_after_capture();
 }
 

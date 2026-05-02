@@ -43,8 +43,10 @@ SYM_CODE_START(sev_snapshot_resume_from_ptregs)
 .Lsev_snapshot_no_bridge_l2e_restore:
 
 	testb	$3, CS(%rsp)
-	jz	restore_regs_and_return_to_kernel
+	jz	.Lsev_snapshot_restore_to_kernel
 	jmp	swapgs_restore_regs_and_return_to_usermode
+.Lsev_snapshot_restore_to_kernel:
+	jmp	restore_regs_and_return_to_kernel
 SYM_CODE_END(sev_snapshot_resume_from_ptregs)
 
 SYM_CODE_START(sev_snapshot_restore_entry_early)
