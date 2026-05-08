@@ -17,6 +17,7 @@
 .section .entry.text, "ax"
 
 .extern restore_regs_and_return_to_kernel
+.extern sev_snapshot_sysret_from_ptregs
 .extern swapgs_restore_regs_and_return_to_usermode
 .extern sev_snapshot_restore_bridge_l2e_va
 .extern sev_snapshot_restore_from_mailbox
@@ -44,7 +45,7 @@ SYM_CODE_START(sev_snapshot_resume_from_ptregs)
 
 	testb	$3, CS(%rsp)
 	jz	.Lsev_snapshot_restore_to_kernel
-	jmp	swapgs_restore_regs_and_return_to_usermode
+	jmp	sev_snapshot_sysret_from_ptregs
 .Lsev_snapshot_restore_to_kernel:
 	jmp	restore_regs_and_return_to_kernel
 SYM_CODE_END(sev_snapshot_resume_from_ptregs)

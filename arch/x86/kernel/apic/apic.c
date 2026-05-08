@@ -73,6 +73,8 @@ EXPORT_SYMBOL_GPL(boot_cpu_physical_apicid);
 
 u8 boot_cpu_apic_version __ro_after_init;
 
+extern bool sev_snapshot_resume_in_progress;
+
 /*
  * The highest APIC ID seen during enumeration.
  */
@@ -1108,6 +1110,8 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_apic_timer_interrupt)
 	struct pt_regs *old_regs = set_irq_regs(regs);
 
 	ack_APIC_irq();
+	if (READ_ONCE(sev_snapshot_resume_in_progress))
+		generic_smp_call_function_single_interrupt();
 	trace_local_timer_entry(LOCAL_TIMER_VECTOR);
 	local_apic_timer_interrupt();
 	trace_local_timer_exit(LOCAL_TIMER_VECTOR);

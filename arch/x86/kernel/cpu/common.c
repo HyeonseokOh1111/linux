@@ -1796,6 +1796,23 @@ static void validate_apic_and_package_id(struct cpuinfo_x86 *c)
 #endif
 }
 
+static void snp_fixup_secondary_apic_id(struct cpuinfo_x86 *c)
+{
+#ifdef CONFIG_SMP
+	unsigned int apicid, cpu = smp_processor_id();
+
+	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP) || !cpu)
+		return;
+
+	apicid = apic->cpu_present_to_apicid(cpu);
+	if (apicid == BAD_APICID || apicid == c->apicid)
+		return;
+
+	c->initial_apicid = apicid;
+	c->apicid = apicid;
+#endif
+}
+
 /*
  * This does the hard work of actually picking apart the CPU stuff...
  */
@@ -1978,6 +1995,7 @@ void identify_secondary_cpu(struct cpuinfo_x86 *c)
 {
 	BUG_ON(c == &boot_cpu_data);
 	identify_cpu(c);
+	snp_fixup_secondary_apic_id(c);
 #ifdef CONFIG_X86_32
 	enable_sep_cpu();
 #endif

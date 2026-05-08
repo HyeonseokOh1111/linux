@@ -621,6 +621,20 @@ __irqentry_text_start:
 __irqentry_text_end:
 	ANNOTATE_NOENDBR
 
+SYM_CODE_START(sev_snapshot_sysret_from_ptregs)
+	UNWIND_HINT_REGS
+
+	POP_REGS pop_rdi=0
+
+	/* Snapshot resumes a syscall-exit frame. */
+	movq	2*8(%rsp), %rcx	/* user RIP */
+	movq	4*8(%rsp), %r11	/* user RFLAGS */
+	movq	0*8(%rsp), %rdi	/* user RDI */
+	movq	5*8(%rsp), %rsp	/* user RSP */
+	swapgs
+	sysretq
+SYM_CODE_END(sev_snapshot_sysret_from_ptregs)
+
 SYM_CODE_START_LOCAL(common_interrupt_return)
 SYM_INNER_LABEL(swapgs_restore_regs_and_return_to_usermode, SYM_L_GLOBAL)
 	IBRS_EXIT

@@ -57,6 +57,7 @@ struct sev_snapshot_cpu_context {
 	u8 xsave[PAGE_SIZE];
 	u64 restore_gdt_page_va;
 	u64 restore_gdt_page_pa;
+	u64 restore_from_mailbox_rip;
 };
 
 struct sev_snapshot_mailbox {
@@ -85,14 +86,17 @@ struct sev_snapshot_mailbox {
 	 SEV_SNAPSHOT_CPU_CTX_F_TR |		\
 	 SEV_SNAPSHOT_CPU_CTX_F_PKRU)
 
-static_assert(sizeof(struct sev_snapshot_cpu_context) == 0x11e8);
+static_assert(sizeof(struct sev_snapshot_cpu_context) == 0x11f0);
 
 extern void sev_snapshot_restore_entry_early(struct sev_snapshot_mailbox *mailbox);
 extern void sev_snapshot_restore_from_mailbox(struct sev_snapshot_mailbox *mailbox,
-					      u64 *bridge_l2e_record);
+					      u64 restore_cpu_id);
 extern void sev_snapshot_resume_from_ptregs(struct pt_regs *regs);
 
+extern bool sev_snapshot_resume_in_progress;
+
 void sev_snapshot_seed_known_shared_extents(void);
+void sev_snapshot_reset_offline_ghcb_state(void);
 void sev_snapshot_register_boot_ghcb(void);
 void sev_snapshot_register_runtime_ghcb(void);
 u64 sev_snapshot_runtime_ghcb_pa(void);

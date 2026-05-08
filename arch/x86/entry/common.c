@@ -258,6 +258,11 @@ SYSCALL_DEFINE0(snapshot_enter)
 {
 	return sev_snapshot_arm();
 }
+
+SYSCALL_DEFINE0(snapshot_online_secondary_cpus)
+{
+	return sev_snapshot_online_secondary_cpus();
+}
 #endif
 
 #ifdef CONFIG_XEN_PV

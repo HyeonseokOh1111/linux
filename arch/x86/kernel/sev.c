@@ -12,6 +12,7 @@
 #include <linux/sched/debug.h>	/* For show_regs() */
 #include <linux/percpu-defs.h>
 #include <linux/cc_platform.h>
+#include <linux/cpu.h>
 #include <linux/printk.h>
 #include <linux/mm_types.h>
 #include <linux/set_memory.h>
@@ -1056,7 +1057,7 @@ static void *snp_alloc_vmsa_page(void)
 	 *
 	 * Allocate an 8k page which is also 8k-aligned.
 	 */
-	p = alloc_pages(GFP_KERNEL_ACCOUNT | __GFP_ZERO, 1);
+	p = alloc_pages(GFP_KERNEL_ACCOUNT, 1);
 	if (!p)
 		return NULL;
 
@@ -1064,6 +1065,14 @@ static void *snp_alloc_vmsa_page(void)
 
 	/* Free the first 4k. This page may be 2M/1G aligned and cannot be used. */
 	__free_page(p);
+
+	/*
+	 * Restore can lazily materialize private pages.  AP creation hands this
+	 * GPA directly to KVM as a VMSA, so force the host-side private backing
+	 * to exist before RMPADJUST marks the page as VMSA.
+	 */
+	snp_set_memory_private((unsigned long)page_address(p + 1), 1);
+	memset(page_address(p + 1), 0, PAGE_SIZE);
 
 	return page_address(p + 1);
 }
@@ -1380,6 +1389,30 @@ void sev_snapshot_register_runtime_ghcb(void)
 	snp_register_snapshot_boot_ghcb();
 }
 
+void sev_snapshot_reset_offline_ghcb_state(void)
+{
+	int cpu;
+
+	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
+		return;
+
+	for_each_possible_cpu(cpu) {
+		struct sev_es_runtime_data *data;
+
+		if (cpu_online(cpu))
+			continue;
+
+		data = per_cpu(runtime_data, cpu);
+		if (!data)
+			continue;
+
+		data->ghcb_active = false;
+		data->backup_ghcb_active = false;
+		vc_ghcb_invalidate(&data->ghcb_page);
+		vc_ghcb_invalidate(&data->backup_ghcb);
+	}
+}
+
 bool sev_snapshot_negotiate_runtime_ghcb_protocol(void)
 {
 	u64 val;
@@ -1436,7 +1469,7 @@ void setup_ghcb(void)
 		return;
 
 	/* First make sure the hypervisor talks a supported protocol. */
-	if (!sev_es_negotiate_protocol()) {
+	if (!READ_ONCE(ghcb_version) && !sev_es_negotiate_protocol()) {
 		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
 	}
 
@@ -1718,16 +1751,22 @@ static enum es_result vc_handle_mmio_movs(struct es_em_ctxt *ctxt,
 		return ES_RETRY;
 }
 
-static enum es_result vc_handle_invalid(struct ghcb *ghcb, struct es_em_ctxt *ctxt) 
+static enum es_result vc_handle_invalid(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
 {
 	unsigned long fault_addr;
-	asm volatile("movq %%cr2, %[some]"
-    		: [some] "=r" (fault_addr)
-		);
 
-	pvalidate_pages(fault_addr, 1, 1);
+	(void)ghcb;
+
+	fault_addr = native_read_cr2();
+
+	if (user_mode(ctxt->regs))
+		stac();
+	pvalidate_pages(fault_addr, 1, true);
+	if (user_mode(ctxt->regs))
+		clac();
+
 	ctxt->insn.length = 0;
-	return ES_OK;	
+	return ES_OK;
 }
 
 static enum es_result vc_handle_mmio(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
