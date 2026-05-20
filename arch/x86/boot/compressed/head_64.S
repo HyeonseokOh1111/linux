@@ -309,31 +309,6 @@ SYM_FUNC_END(efi32_stub_entry)
 	.code64
 	.org 0x200
 SYM_CODE_START(startup_64)
-
-	mov       $0xC0010131, %ecx
-    rdmsr
-    bt        $1, %eax
-	jc		  sev_es_debug
-
-	movl	  $0x39, %eax
-	outb	  $0x80
-	jmp 	  sev_es_debug_end
-
-sev_es_debug:
-	# DEBUG signal entry point for
-	movl $0xC0010130, %ecx
-	xorl %eax, %eax
-	xorl %edx, %edx
-	movl $0x03, %edx
-    shl  $20, %edx
-	movl $0x14, %eax
-	wrmsr
-	vmgexit
-
-	xorl %eax, %eax
-	xorl %edx, %edx
-	xorl %ecx, %ecx
-sev_es_debug_end:
 	/*
 	 * 64bit entry is 0x200 and it is ABI so immutable!
 	 * We come here either from startup_32 or directly from a
