@@ -990,6 +990,8 @@ static void set_pages_state(unsigned long vaddr, unsigned int npages, int op)
 				   (VMGEXIT_PSC_MAX_ENTRY * PAGE_SIZE) + vaddr);
 
 		__set_pages_state(desc, vaddr, next_vaddr, op);
+		sev_snapshot_track_psc_entries(desc->entries,
+						desc->hdr.end_entry + 1, op);
 
 		vaddr = next_vaddr;
 	}
@@ -1005,8 +1007,6 @@ void snp_set_memory_shared(unsigned long vaddr, unsigned int npages)
 	pvalidate_pages(vaddr, npages, false);
 
 	set_pages_state(vaddr, npages, SNP_PAGE_STATE_SHARED);
-	sev_snapshot_track_page_state(vaddr, npages, SNP_PAGE_STATE_SHARED);
-
 }
 
 void snp_set_memory_private(unsigned long vaddr, unsigned int npages)
@@ -1017,7 +1017,6 @@ void snp_set_memory_private(unsigned long vaddr, unsigned int npages)
 	set_pages_state(vaddr, npages, SNP_PAGE_STATE_PRIVATE);
 
 	pvalidate_pages(vaddr, npages, true);
-	sev_snapshot_track_page_state(vaddr, npages, SNP_PAGE_STATE_PRIVATE);
 }
 
 static int snp_set_vmsa(void *va, bool vmsa)

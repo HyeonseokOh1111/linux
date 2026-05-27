@@ -29,6 +29,7 @@
 #include <linux/string.h>
 #include <linux/tick.h>
 #include <linux/uaccess.h>
+#include <linux/virtio.h>
 
 #include <asm/current.h>
 #include <asm/apic.h>
@@ -44,15 +45,18 @@
 #include <asm/fpu/xcr.h>
 #include <asm/gsseg.h>
 #include <asm/irq_vectors.h>
+#include <asm/kvm_para.h>
 #include <asm/mem_encrypt.h>
 #include <asm/msr.h>
 #include <asm/paravirt.h>
+#include <asm/pgtable.h>
 #include <asm/pgtable_types.h>
 #include <asm/pkru.h>
 #include <asm/proto.h>
 #include <asm/processor-flags.h>
 #include <asm/sev.h>
 #include <asm/segment.h>
+#include <asm/set_memory.h>
 #include <asm/smap.h>
 #include <asm/smp.h>
 #include <asm/special_insns.h>
@@ -66,7 +70,7 @@
 #include "sev_snapshot.h"
 
 #define SEV_SNAPSHOT_MAILBOX_SIZE		SZ_2M
-#define SEV_SNAPSHOT_FIXED_MAILBOX_PA		0x00600000ULL
+#define SEV_SNAPSHOT_FIXED_MAILBOX_PA		0x00e00000ULL
 #define SEV_SNAPSHOT_CONTROL_SHARED_PA		0x00200000ULL
 #define SEV_SNAPSHOT_CONTROL_SHARED_SIZE	SZ_2M
 #define SEV_SNAPSHOT_ATTESTATION_REQUEST_OFFSET \
@@ -94,9 +98,13 @@ bool sev_snapshot_resume_in_progress;
 static cpumask_t sev_snapshot_saved_cpus_allowed;
 static bool sev_snapshot_saved_cpus_allowed_valid;
 static cpumask_t sev_snapshot_capture_offlined_cpus;
+/* Rollback note: disable these hooks together with Firecracker host replay re-enablement. */
+static bool sev_snapshot_virtio_devices_frozen;
 static struct sev_snapshot_shared_extent
 	sev_snapshot_shared_extents[SEV_SNAPSHOT_SHARED_EXTENT_MAX];
 static u32 sev_snapshot_shared_extent_count;
+
+extern char __init_scratch_begin[], __init_scratch_end[];
 
 static void sev_snapshot_map_request_page_locked(void);
 static void sev_snapshot_resume_local_tick(void);
@@ -310,8 +318,44 @@ long sev_snapshot_online_secondary_cpus(void)
 
 static void sev_snapshot_abort_capture_setup(void)
 {
+	if (READ_ONCE(sev_snapshot_virtio_devices_frozen)) {
+		if (virtio_sev_snapshot_restore_devices())
+			pr_warn("failed to restore virtio devices after snapshot abort\n");
+		WRITE_ONCE(sev_snapshot_virtio_devices_frozen, false);
+	}
 	sev_snapshot_online_capture_offlined_cpus();
 	sev_snapshot_restore_current_affinity();
+}
+
+static int sev_snapshot_freeze_virtio_devices(void)
+{
+	int ret;
+
+	ret = virtio_sev_snapshot_freeze_devices();
+	if (ret) {
+		virtio_sev_snapshot_restore_devices();
+		return ret;
+	}
+
+	WRITE_ONCE(sev_snapshot_virtio_devices_frozen, true);
+	return 0;
+}
+
+static int sev_snapshot_restore_virtio_devices(void)
+{
+	int ret;
+
+	if (!READ_ONCE(sev_snapshot_virtio_devices_frozen))
+		return 0;
+
+	local_irq_enable();
+	ret = virtio_sev_snapshot_restore_devices();
+	local_irq_disable();
+	if (ret)
+		return ret;
+
+	WRITE_ONCE(sev_snapshot_virtio_devices_frozen, false);
+	return 0;
 }
 
 static void sev_snapshot_install_sp0_scratch_stack(void)
@@ -319,14 +363,38 @@ static void sev_snapshot_install_sp0_scratch_stack(void)
 #ifdef CONFIG_X86_64
 	unsigned long scratch_top;
 
-	if (!READ_ONCE(sev_snapshot_resume_in_progress))
-		return;
-
-	scratch_top = __this_cpu_ist_top_va(MCE);
-	if (!scratch_top)
-		return;
-
+	scratch_top = (unsigned long)(cpu_entry_stack(raw_smp_processor_id()) + 1);
 	load_sp0(scratch_top);
+#endif
+}
+
+static void sev_snapshot_restore_irq_stack_ptr(
+	const struct sev_snapshot_cpu_context *ctx)
+{
+#ifdef CONFIG_X86_64
+	if (!ctx || !ctx->hardirq_stack_ptr)
+		return;
+
+	this_cpu_write(pcpu_hot.hardirq_stack_ptr,
+		       (void *)(unsigned long)ctx->hardirq_stack_ptr);
+#endif
+}
+
+static void sev_snapshot_enter_irq_stack_restore_window(
+	const struct sev_snapshot_cpu_context *ctx)
+{
+#ifdef CONFIG_X86_64
+	sev_snapshot_restore_irq_stack_ptr(ctx);
+	this_cpu_write(pcpu_hot.hardirq_stack_inuse, true);
+#endif
+}
+
+static void sev_snapshot_leave_irq_stack_restore_window(
+	const struct sev_snapshot_cpu_context *ctx)
+{
+#ifdef CONFIG_X86_64
+	sev_snapshot_restore_irq_stack_ptr(ctx);
+	this_cpu_write(pcpu_hot.hardirq_stack_inuse, false);
 #endif
 }
 
@@ -367,14 +435,15 @@ static int sev_snapshot_map_transport_pages(void)
 	return 0;
 }
 
-static void sev_snapshot_remove_shared_extent_locked(u64 gpa, u64 npages)
+static void sev_snapshot_remove_extent_locked(struct sev_snapshot_shared_extent *extents,
+					      u32 *count, u32 max_count,
+					      u64 gpa, u64 npages)
 {
 	u64 end = gpa + (npages << PAGE_SHIFT);
 	u32 i;
 
-	for (i = 0; i < sev_snapshot_shared_extent_count;) {
-		struct sev_snapshot_shared_extent *extent =
-			&sev_snapshot_shared_extents[i];
+	for (i = 0; i < *count;) {
+		struct sev_snapshot_shared_extent *extent = &extents[i];
 		u64 extent_start = extent->gpa;
 		u64 extent_end = extent->gpa + (extent->npages << PAGE_SHIFT);
 
@@ -385,9 +454,9 @@ static void sev_snapshot_remove_shared_extent_locked(u64 gpa, u64 npages)
 
 		if (gpa <= extent_start && end >= extent_end) {
 			memmove(extent, extent + 1,
-				(sev_snapshot_shared_extent_count - i - 1) *
+				(*count - i - 1) *
 				sizeof(*extent));
-			sev_snapshot_shared_extent_count--;
+			(*count)--;
 			continue;
 		}
 
@@ -404,16 +473,16 @@ static void sev_snapshot_remove_shared_extent_locked(u64 gpa, u64 npages)
 			continue;
 		}
 
-		if (sev_snapshot_shared_extent_count >= SEV_SNAPSHOT_SHARED_EXTENT_MAX) {
+		if (*count >= max_count) {
 			extent->npages = (gpa - extent_start) >> PAGE_SHIFT;
 			i++;
 			continue;
 		}
 
 		memmove(extent + 2, extent + 1,
-			(sev_snapshot_shared_extent_count - i - 1) *
+			(*count - i - 1) *
 			sizeof(*extent));
-		sev_snapshot_shared_extent_count++;
+		(*count)++;
 		extent[1].gpa = end;
 		extent[1].npages = (extent_end - end) >> PAGE_SHIFT;
 		extent->npages = (gpa - extent_start) >> PAGE_SHIFT;
@@ -421,12 +490,66 @@ static void sev_snapshot_remove_shared_extent_locked(u64 gpa, u64 npages)
 	}
 }
 
-static void sev_snapshot_add_shared_extent_locked(u64 gpa, u64 npages)
+static bool sev_snapshot_add_extent_locked(struct sev_snapshot_shared_extent *extents,
+					   u32 *count, u32 max_count,
+					   u64 gpa, u64 npages)
 {
 	u64 end = gpa + (npages << PAGE_SHIFT);
 	u32 i;
 
-	sev_snapshot_remove_shared_extent_locked(gpa, npages);
+	sev_snapshot_remove_extent_locked(extents, count, max_count, gpa, npages);
+
+	for (i = 0; i < *count; i++) {
+		struct sev_snapshot_shared_extent *extent = &extents[i];
+		u64 extent_start = extent->gpa;
+		u64 extent_end = extent->gpa + (extent->npages << PAGE_SHIFT);
+
+		if (extent_end == gpa) {
+			extent->npages += npages;
+			return true;
+		}
+
+		if (end == extent_start) {
+			extent->gpa = gpa;
+			extent->npages += npages;
+			return true;
+		}
+	}
+
+	if (*count >= max_count)
+		return false;
+
+	extents[*count].gpa = gpa;
+	extents[*count].npages = npages;
+	(*count)++;
+	return true;
+}
+
+static void sev_snapshot_remove_shared_extent_locked(u64 gpa, u64 npages)
+{
+	sev_snapshot_remove_extent_locked(sev_snapshot_shared_extents,
+					  &sev_snapshot_shared_extent_count,
+					  SEV_SNAPSHOT_SHARED_EXTENT_MAX,
+					  gpa, npages);
+}
+
+static void sev_snapshot_add_shared_extent_locked(u64 gpa, u64 npages)
+{
+	if (!sev_snapshot_add_extent_locked(sev_snapshot_shared_extents,
+					    &sev_snapshot_shared_extent_count,
+					    SEV_SNAPSHOT_SHARED_EXTENT_MAX,
+					    gpa, npages)) {
+		if (!sev_snapshot_warned_extent_capacity) {
+			pr_warn("SEV snapshot shared extent table is full\n");
+			sev_snapshot_warned_extent_capacity = true;
+		}
+	}
+}
+
+static bool sev_snapshot_shared_extent_contains_locked(u64 gpa, u64 npages)
+{
+	u64 end = gpa + (npages << PAGE_SHIFT);
+	u32 i;
 
 	for (i = 0; i < sev_snapshot_shared_extent_count; i++) {
 		struct sev_snapshot_shared_extent *extent =
@@ -434,30 +557,23 @@ static void sev_snapshot_add_shared_extent_locked(u64 gpa, u64 npages)
 		u64 extent_start = extent->gpa;
 		u64 extent_end = extent->gpa + (extent->npages << PAGE_SHIFT);
 
-		if (extent_end == gpa) {
-			extent->npages += npages;
-			return;
-		}
-
-		if (end == extent_start) {
-			extent->gpa = gpa;
-			extent->npages += npages;
-			return;
-		}
+		if (extent_start <= gpa && end <= extent_end)
+			return true;
 	}
 
-	if (sev_snapshot_shared_extent_count >= SEV_SNAPSHOT_SHARED_EXTENT_MAX) {
-		if (!sev_snapshot_warned_extent_capacity) {
-			pr_warn("SEV snapshot shared extent table is full\n");
-			sev_snapshot_warned_extent_capacity = true;
-		}
-		return;
-	}
+	return false;
+}
 
-	sev_snapshot_shared_extents[sev_snapshot_shared_extent_count].gpa = gpa;
-	sev_snapshot_shared_extents[sev_snapshot_shared_extent_count].npages =
-		npages;
-	sev_snapshot_shared_extent_count++;
+static bool sev_snapshot_shared_extent_contains(u64 gpa, u64 npages)
+{
+	unsigned long flags;
+	bool contains;
+
+	raw_spin_lock_irqsave(&sev_snapshot_shared_lock, flags);
+	contains = sev_snapshot_shared_extent_contains_locked(gpa, npages);
+	raw_spin_unlock_irqrestore(&sev_snapshot_shared_lock, flags);
+
+	return contains;
 }
 
 void sev_snapshot_track_page_state_pa(unsigned long paddr, unsigned int npages,
@@ -467,6 +583,9 @@ void sev_snapshot_track_page_state_pa(unsigned long paddr, unsigned int npages,
 	u64 gpa;
 
 	if (!npages)
+		return;
+
+	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
 		return;
 
 	gpa = paddr & PAGE_MASK;
@@ -479,9 +598,117 @@ void sev_snapshot_track_page_state_pa(unsigned long paddr, unsigned int npages,
 	raw_spin_unlock_irqrestore(&sev_snapshot_shared_lock, flags);
 }
 
+static bool sev_snapshot_direct_map_entry(unsigned long vaddr,
+					  unsigned int *level,
+					  unsigned long *entry,
+					  unsigned long *size)
+{
+	pte_t *kpte;
+
+	kpte = lookup_address(vaddr, level);
+	if (!kpte || pte_none(*kpte))
+		return false;
+
+	if (*level != PG_LEVEL_4K && *level != PG_LEVEL_2M &&
+	    *level != PG_LEVEL_1G)
+		return false;
+
+	*entry = pte_val(*kpte);
+	if (!(*entry & _PAGE_PRESENT))
+		return false;
+
+	*size = page_level_size(*level);
+	return true;
+}
+
+static int sev_snapshot_encrypt_init_scratch_run(unsigned long *run_start,
+						 unsigned long *run_npages)
+{
+	int ret;
+
+	if (!*run_npages)
+		return 0;
+
+	ret = set_memory_encrypted(*run_start, *run_npages);
+	if (ret)
+		pr_warn("failed to make init scratch private [mem %#010lx-%#010lx]\n",
+			*run_start, *run_start + (*run_npages << PAGE_SHIFT) - 1);
+
+	*run_start = 0;
+	*run_npages = 0;
+	return ret;
+}
+
+static int sev_snapshot_encrypt_init_scratch_decrypted_pages(void)
+{
+	unsigned long paddr, paddr_end, run_start = 0, run_npages = 0;
+	int ret;
+
+	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP) || !sme_me_mask)
+		return 0;
+
+	paddr = ALIGN_DOWN(__pa_symbol(__init_scratch_begin), PAGE_SIZE);
+	paddr_end = PAGE_ALIGN(__pa_symbol(__init_scratch_end));
+
+	for (; paddr < paddr_end; paddr += PAGE_SIZE) {
+		unsigned long vaddr = (unsigned long)__va(paddr);
+		unsigned long entry, size;
+		unsigned int level;
+		bool decrypted;
+
+		decrypted = sev_snapshot_direct_map_entry(vaddr, &level, &entry,
+							  &size) &&
+			    !(entry & sme_me_mask);
+		if (!decrypted ||
+		    sev_snapshot_shared_extent_contains(paddr, 1)) {
+			ret = sev_snapshot_encrypt_init_scratch_run(&run_start,
+								   &run_npages);
+			if (ret)
+				return ret;
+			continue;
+		}
+
+		if (!run_npages)
+			run_start = vaddr;
+		run_npages++;
+	}
+
+	return sev_snapshot_encrypt_init_scratch_run(&run_start, &run_npages);
+}
+
 static void sev_snapshot_rebuild_shared_extents_from_direct_map(void)
 {
-	/* Shared/private transitions are tracked when they happen. */
+	unsigned long end_pfn = max_pfn_mapped;
+	unsigned long pfn;
+
+	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP) || !sme_me_mask)
+		return;
+
+	for (pfn = 0; pfn < end_pfn;) {
+		unsigned long paddr = PFN_PHYS(pfn);
+		unsigned long vaddr = (unsigned long)__va(paddr);
+		unsigned long entry, size, npages;
+		unsigned int level;
+
+		if (!sev_snapshot_direct_map_entry(vaddr, &level, &entry,
+						   &size)) {
+			pfn++;
+			continue;
+		}
+
+		npages = min_t(unsigned long, size >> PAGE_SHIFT,
+			       end_pfn - pfn);
+		if (!npages) {
+			pfn++;
+			continue;
+		}
+
+		if (!(entry & sme_me_mask))
+			sev_snapshot_track_page_state_pa(paddr, npages,
+							 SNP_PAGE_STATE_SHARED);
+
+		pfn += npages;
+	}
 }
 
 static void sev_snapshot_flush_shared_extents(struct sev_snapshot_mailbox *mailbox)
@@ -596,16 +823,16 @@ void sev_snapshot_track_psc_entries(struct psc_entry *entries,
 			continue;
 		}
 
-			sev_snapshot_track_page_state((unsigned long)__va(range_start),
-						      (next_gpa - range_start) >> PAGE_SHIFT,
-						      op);
+		sev_snapshot_track_page_state_pa(range_start,
+						 (next_gpa - range_start) >> PAGE_SHIFT,
+						 op);
 		range_start = gpa;
 		next_gpa = gpa + PAGE_SIZE;
 	}
 
-	sev_snapshot_track_page_state((unsigned long)__va(range_start),
-				      (next_gpa - range_start) >> PAGE_SHIFT,
-				      op);
+	sev_snapshot_track_page_state_pa(range_start,
+					 (next_gpa - range_start) >> PAGE_SHIFT,
+					 op);
 }
 
 static void sev_snapshot_fill_xsave(struct sev_snapshot_cpu_context *ctx)
@@ -679,6 +906,9 @@ static void sev_snapshot_fill_context(struct sev_snapshot_cpu_context *ctx,
 	ctx->restore_gdt_page_va = (u64)sev_snapshot_restore_gdt_page;
 	ctx->restore_gdt_page_pa = __pa_symbol(sev_snapshot_restore_gdt_page);
 	ctx->restore_from_mailbox_rip = (u64)sev_snapshot_restore_from_mailbox;
+#ifdef CONFIG_X86_64
+	ctx->hardirq_stack_ptr = (u64)this_cpu_read(pcpu_hot.hardirq_stack_ptr);
+#endif
 
 	sev_snapshot_fill_xsave(ctx);
 }
@@ -727,6 +957,10 @@ static int sev_snapshot_prepare_capture(void)
 		return -ENODEV;
 
 	sev_snapshot_shared_init();
+	ret = sev_snapshot_encrypt_init_scratch_decrypted_pages();
+	if (ret)
+		return ret;
+
 	mailbox = sev_snapshot_mailbox_va();
 	if (!mailbox)
 		return -ENODEV;
@@ -752,6 +986,10 @@ static long sev_snapshot_capture_final(const struct pt_regs *regs)
 		return -EINVAL;
 
 	memset(mailbox, 0, sizeof(*mailbox));
+	ret = sev_snapshot_freeze_virtio_devices();
+	if (ret)
+		return ret;
+
 	sev_snapshot_fill_context(&mailbox->cpu_ctx, regs);
 	sev_snapshot_suspend_local_tick();
 	sev_snapshot_rebuild_shared_extents_from_direct_map();
@@ -830,6 +1068,17 @@ static __always_inline void __noreturn sev_snapshot_restore_fault(void)
 	unreachable();
 }
 
+static __always_inline void sev_snapshot_restore_copy(void *dst, const void *src,
+						     size_t len)
+{
+	u8 *d = dst;
+	const u8 *s = src;
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		WRITE_ONCE(d[i], READ_ONCE(s[i]));
+}
+
 static void sev_snapshot_restore_xsave_state(
 	const struct sev_snapshot_cpu_context *ctx)
 {
@@ -878,7 +1127,7 @@ static void sev_snapshot_prepare_restore_gdt(
 		sev_snapshot_restore_fault();
 
 	gdt_base = sev_snapshot_restore_gdt_page;
-	memcpy(gdt_base, ctx->gdt_copy, gdt_size);
+	sev_snapshot_restore_copy(gdt_base, ctx->gdt_copy, gdt_size);
 
 	tss = (struct ldttss_desc *)((u8 *)gdt_base + tss_offset);
 
@@ -902,22 +1151,6 @@ static void sev_snapshot_restore_tr_from_gdt(const struct desc_ptr *gdt_desc,
 		sev_snapshot_restore_fault();
 
 	asm volatile("ltr %0" : : "m" (restore_tss));
-}
-
-static void sev_snapshot_prefault_user_stack(const struct pt_regs *regs)
-{
-	u64 user_rsp;
-
-	if (!regs)
-		return;
-
-	user_rsp = regs->sp;
-	if (!user_rsp)
-		return;
-
-	stac();
-	(void)READ_ONCE(*(u64 *)(unsigned long)user_rsp);
-	clac();
 }
 
 static __always_inline void sev_snapshot_reload_kernel_cs(void)
@@ -1000,7 +1233,7 @@ void __noreturn sev_snapshot_restore_from_mailbox(
 	sev_snapshot_restore_tr_from_gdt(&restore_gdt_desc, restore_tss);
 
 	regs = (struct pt_regs *)(unsigned long)ctx->kernel_regs_ptr;
-	memcpy(regs, &ctx->regs, sizeof(*regs));
+	sev_snapshot_restore_copy(regs, &ctx->regs, sizeof(*regs));
 	regs->flags &= ~X86_EFLAGS_TF;
 
 	write_cr0(ctx->cr0);
@@ -1014,26 +1247,29 @@ void __noreturn sev_snapshot_restore_from_mailbox(
 	wrmsrl(MSR_FS_BASE, ctx->fs_base);
 	wrmsrl(MSR_GS_BASE, ctx->kernel_gs_base);
 	wrmsrl(MSR_KERNEL_GS_BASE, ctx->user_gs_base);
+	sev_snapshot_enter_irq_stack_restore_window(ctx);
 	syscall_init();
 	write_pkru(ctx->pkru);
 
 	sev_snapshot_restore_xsave_state(ctx);
 
-	sev_snapshot_prefault_user_stack(regs);
 	sev_snapshot_install_sp0_scratch_stack();
-	sev_snapshot_prefault_user_stack(regs);
 
 	native_write_cr4(ctx->cr4);
+	kvm_sev_snapshot_restore_reinit();
 	sev_snapshot_drain_local_apic_isr();
 	sev_snapshot_clear_idle_polling_flags();
-	local_irq_enable();
 	sev_snapshot_resume_local_tick();
 	sev_snapshot_rearm_boot_local_apic_timer();
+	if (sev_snapshot_restore_virtio_devices())
+		sev_snapshot_restore_fault();
 
 	if (sev_snapshot_restore_needs_secondary_cpu_sync()) {
 		sev_snapshot_reset_offline_ghcb_state();
 		WRITE_ONCE(sev_snapshot_resume_in_progress, true);
 	}
+	local_irq_disable();
+	sev_snapshot_leave_irq_stack_restore_window(ctx);
 	sev_snapshot_resume_from_ptregs(regs);
 	unreachable();
 }

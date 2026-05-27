@@ -58,6 +58,7 @@ struct sev_snapshot_cpu_context {
 	u64 restore_gdt_page_va;
 	u64 restore_gdt_page_pa;
 	u64 restore_from_mailbox_rip;
+	u64 hardirq_stack_ptr;
 };
 
 struct sev_snapshot_mailbox {
@@ -86,7 +87,7 @@ struct sev_snapshot_mailbox {
 	 SEV_SNAPSHOT_CPU_CTX_F_TR |		\
 	 SEV_SNAPSHOT_CPU_CTX_F_PKRU)
 
-static_assert(sizeof(struct sev_snapshot_cpu_context) == 0x11f0);
+static_assert(sizeof(struct sev_snapshot_cpu_context) == 0x11f8);
 
 extern void sev_snapshot_restore_entry_early(struct sev_snapshot_mailbox *mailbox);
 extern void sev_snapshot_restore_from_mailbox(struct sev_snapshot_mailbox *mailbox,

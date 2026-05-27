@@ -1636,7 +1636,6 @@ static void virtblk_remove(struct virtio_device *vdev)
 	put_disk(vblk->disk);
 }
 
-#ifdef CONFIG_PM_SLEEP
 static int virtblk_freeze(struct virtio_device *vdev)
 {
 	struct virtio_blk *vblk = vdev->priv;
@@ -1669,7 +1668,6 @@ static int virtblk_restore(struct virtio_device *vdev)
 	blk_mq_unquiesce_queue(vblk->disk->queue);
 	return 0;
 }
-#endif
 
 static const struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_BLOCK, VIRTIO_DEV_ANY_ID },
@@ -1703,10 +1701,8 @@ static struct virtio_driver virtio_blk = {
 	.probe				= virtblk_probe,
 	.remove				= virtblk_remove,
 	.config_changed			= virtblk_config_changed,
-#ifdef CONFIG_PM_SLEEP
 	.freeze				= virtblk_freeze,
 	.restore			= virtblk_restore,
-#endif
 };
 
 static int __init virtio_blk_init(void)

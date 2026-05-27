@@ -43,6 +43,7 @@
 #include <asm/reboot.h>
 #include <asm/svm.h>
 #include <asm/e820/api.h>
+#include <asm/x86_init.h>
 
 DEFINE_STATIC_KEY_FALSE(kvm_async_pf_enabled);
 
@@ -739,6 +740,25 @@ static void kvm_resume(void)
 	if (kvm_para_has_feature(KVM_FEATURE_POLL_CONTROL) && has_guest_poll)
 		wrmsrl(MSR_KVM_POLL_CONTROL, 0);
 #endif
+}
+
+void kvm_sev_snapshot_restore_reinit(void)
+{
+	unsigned long flags;
+
+	if (!kvm_para_available())
+		return;
+
+	local_irq_save(flags);
+	if (x86_platform.restore_sched_clock_state)
+		x86_platform.restore_sched_clock_state();
+	kvm_guest_cpu_init();
+
+#ifdef CONFIG_ARCH_CPUIDLE_HALTPOLL
+	if (kvm_para_has_feature(KVM_FEATURE_POLL_CONTROL) && has_guest_poll)
+		wrmsrl(MSR_KVM_POLL_CONTROL, 0);
+#endif
+	local_irq_restore(flags);
 }
 
 static struct syscore_ops kvm_syscore_ops = {

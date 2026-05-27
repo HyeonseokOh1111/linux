@@ -141,10 +141,8 @@ void __virtqueue_break(struct virtqueue *_vq);
 void __virtqueue_unbreak(struct virtqueue *_vq);
 
 void virtio_config_changed(struct virtio_device *dev);
-#ifdef CONFIG_PM_SLEEP
 int virtio_device_freeze(struct virtio_device *dev);
 int virtio_device_restore(struct virtio_device *dev);
-#endif
 void virtio_reset_device(struct virtio_device *dev);
 
 size_t virtio_max_dma_size(const struct virtio_device *vdev);
@@ -181,10 +179,8 @@ struct virtio_driver {
 	void (*scan)(struct virtio_device *dev);
 	void (*remove)(struct virtio_device *dev);
 	void (*config_changed)(struct virtio_device *dev);
-#ifdef CONFIG_PM
 	int (*freeze)(struct virtio_device *dev);
 	int (*restore)(struct virtio_device *dev);
-#endif
 };
 
 static inline struct virtio_driver *drv_to_virtio(struct device_driver *drv)
@@ -194,6 +190,8 @@ static inline struct virtio_driver *drv_to_virtio(struct device_driver *drv)
 
 int register_virtio_driver(struct virtio_driver *drv);
 void unregister_virtio_driver(struct virtio_driver *drv);
+int virtio_sev_snapshot_freeze_devices(void);
+int virtio_sev_snapshot_restore_devices(void);
 
 /* module_virtio_driver() - Helper macro for drivers that don't do
  * anything special in module init/exit.  This eliminates a lot of
