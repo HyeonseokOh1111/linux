@@ -43,6 +43,7 @@
 #include <asm/reboot.h>
 #include <asm/svm.h>
 #include <asm/e820/api.h>
+#include <asm/pvclock.h>
 #include <asm/x86_init.h>
 
 DEFINE_STATIC_KEY_FALSE(kvm_async_pf_enabled);
@@ -753,6 +754,26 @@ void kvm_sev_snapshot_restore_reinit(void)
 	if (x86_platform.restore_sched_clock_state)
 		x86_platform.restore_sched_clock_state();
 	kvm_guest_cpu_init();
+	pvclock_touch_watchdogs();
+
+#ifdef CONFIG_ARCH_CPUIDLE_HALTPOLL
+	if (kvm_para_has_feature(KVM_FEATURE_POLL_CONTROL) && has_guest_poll)
+		wrmsrl(MSR_KVM_POLL_CONTROL, 0);
+#endif
+	local_irq_restore(flags);
+}
+
+void kvm_sev_snapshot_restore_reinit_ap(void)
+{
+	unsigned long flags;
+
+	if (!kvm_para_available())
+		return;
+
+	local_irq_save(flags);
+	x86_cpuinit.early_percpu_clock_init();
+	kvm_guest_cpu_init();
+	pvclock_touch_watchdogs();
 
 #ifdef CONFIG_ARCH_CPUIDLE_HALTPOLL
 	if (kvm_para_has_feature(KVM_FEATURE_POLL_CONTROL) && has_guest_poll)

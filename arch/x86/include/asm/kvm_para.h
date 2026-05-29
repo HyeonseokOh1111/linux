@@ -122,6 +122,7 @@ void kvmclock_init(void);
 void kvmclock_disable(void);
 bool kvm_para_available(void);
 void kvm_sev_snapshot_restore_reinit(void);
+void kvm_sev_snapshot_restore_reinit_ap(void);
 unsigned int kvm_arch_para_features(void);
 unsigned int kvm_arch_para_hints(void);
 void kvm_async_pf_task_wait_schedule(u32 token);
@@ -157,6 +158,10 @@ static inline bool kvm_para_available(void)
 }
 
 static inline void kvm_sev_snapshot_restore_reinit(void)
+{
+}
+
+static inline void kvm_sev_snapshot_restore_reinit_ap(void)
 {
 }
 

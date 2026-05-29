@@ -1349,7 +1349,7 @@ static void snp_register_per_cpu_ghcb(void)
 	snp_register_ghcb_early(__pa(ghcb));
 }
 
-static void snp_register_snapshot_boot_ghcb(void)
+static void snp_register_snapshot_boot_ghcb_cpu(unsigned int cpu)
 {
 	struct sev_es_runtime_data *data;
 	struct ghcb *ghcb;
@@ -1361,7 +1361,7 @@ static void snp_register_snapshot_boot_ghcb(void)
 	 * per-CPU GS base is fully reinstated, so do not rely on
 	 * this_cpu_read(runtime_data) here.
 	 */
-	data = per_cpu(runtime_data, 0);
+	data = per_cpu(runtime_data, cpu);
 	ghcb = &data->ghcb_page;
 	paddr = __pa(ghcb);
 	pfn = paddr >> PAGE_SHIFT;
@@ -1377,6 +1377,11 @@ static void snp_register_snapshot_boot_ghcb(void)
 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_REGISTER);
 }
 
+static void snp_register_snapshot_boot_ghcb(void)
+{
+	snp_register_snapshot_boot_ghcb_cpu(0);
+}
+
 void sev_snapshot_register_runtime_ghcb(void)
 {
 	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
@@ -1386,6 +1391,17 @@ void sev_snapshot_register_runtime_ghcb(void)
 		return;
 
 	snp_register_snapshot_boot_ghcb();
+}
+
+void sev_snapshot_register_runtime_ghcb_cpu(unsigned int cpu)
+{
+	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
+		return;
+
+	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
+		return;
+
+	snp_register_snapshot_boot_ghcb_cpu(cpu);
 }
 
 void sev_snapshot_reset_offline_ghcb_state(void)

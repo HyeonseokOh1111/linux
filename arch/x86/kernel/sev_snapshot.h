@@ -68,6 +68,49 @@ struct sev_snapshot_mailbox {
 	struct sev_snapshot_shared_extent shared_extents[];
 };
 
+#define SEV_SNAPSHOT_MAILBOX_V2_MAGIC		0x32565353U /* "SSV2" */
+#define SEV_SNAPSHOT_MAILBOX_V2_VERSION		1U
+#define SEV_SNAPSHOT_RESTORE_MODE_BSP_HOTPLUG	0U
+#define SEV_SNAPSHOT_RESTORE_MODE_MULTI_VCPU_2	1U
+#define SEV_SNAPSHOT_V2_MAX_CPUS		2U
+
+struct sev_snapshot_mailbox_v2_header {
+	u32 magic;
+	u16 version;
+	u16 header_size;
+	u32 mode;
+	u32 cpu_count;
+	u32 cpu_bundle_len;
+	u32 flags;
+	u32 reserved;
+};
+
+struct sev_snapshot_cpu_topology {
+	u32 linux_cpu_id;
+	u32 apic_id;
+	u32 vcpu_index;
+	u32 reserved;
+};
+
+struct sev_snapshot_restore_barrier {
+	u32 ready;
+	u32 ap_continue;
+	u32 ap_continue_ready;
+	u32 virtio_done;
+	u32 resume_ready;
+	u32 reserved[3];
+};
+
+struct sev_snapshot_mailbox_v2 {
+	struct sev_snapshot_mailbox_v2_header header;
+	struct sev_snapshot_cpu_topology topology[SEV_SNAPSHOT_V2_MAX_CPUS];
+	struct sev_snapshot_cpu_context cpu_ctx[SEV_SNAPSHOT_V2_MAX_CPUS];
+	struct sev_snapshot_restore_barrier restore_barrier;
+	u32 shared_extent_count;
+	u32 reserved;
+	struct sev_snapshot_shared_extent shared_extents[];
+};
+
 #define SEV_SNAPSHOT_CPU_CTX_F_SEGS		BIT(0)
 #define SEV_SNAPSHOT_CPU_CTX_F_BASES		BIT(1)
 #define SEV_SNAPSHOT_CPU_CTX_F_CONTROL		BIT(2)
@@ -100,6 +143,7 @@ void sev_snapshot_seed_known_shared_extents(void);
 void sev_snapshot_reset_offline_ghcb_state(void);
 void sev_snapshot_register_boot_ghcb(void);
 void sev_snapshot_register_runtime_ghcb(void);
+void sev_snapshot_register_runtime_ghcb_cpu(unsigned int cpu);
 u64 sev_snapshot_runtime_ghcb_pa(void);
 void sev_snapshot_track_page_state_pa(unsigned long paddr, unsigned int npages,
 				      enum psc_op op);
