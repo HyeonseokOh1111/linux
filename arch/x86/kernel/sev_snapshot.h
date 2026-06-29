@@ -70,8 +70,9 @@ struct sev_snapshot_mailbox {
 
 #define SEV_SNAPSHOT_MAILBOX_V2_MAGIC		0x32565353U /* "SSV2" */
 #define SEV_SNAPSHOT_MAILBOX_V2_VERSION		1U
-#define SEV_SNAPSHOT_RESTORE_MODE_BSP_HOTPLUG	0U
-#define SEV_SNAPSHOT_RESTORE_MODE_MULTI_VCPU_2	1U
+#define SEV_SNAPSHOT_RESTORE_MODE_SINGLE_VCPU	0U
+#define SEV_SNAPSHOT_RESTORE_MODE_MULTI_VCPU	1U
+#define SEV_SNAPSHOT_V2_MIN_CPUS		1U
 #define SEV_SNAPSHOT_V2_MAX_CPUS		2U
 
 struct sev_snapshot_mailbox_v2_header {
@@ -103,12 +104,7 @@ struct sev_snapshot_restore_barrier {
 
 struct sev_snapshot_mailbox_v2 {
 	struct sev_snapshot_mailbox_v2_header header;
-	struct sev_snapshot_cpu_topology topology[SEV_SNAPSHOT_V2_MAX_CPUS];
-	struct sev_snapshot_cpu_context cpu_ctx[SEV_SNAPSHOT_V2_MAX_CPUS];
-	struct sev_snapshot_restore_barrier restore_barrier;
-	u32 shared_extent_count;
-	u32 reserved;
-	struct sev_snapshot_shared_extent shared_extents[];
+	u8 payload[];
 };
 
 #define SEV_SNAPSHOT_CPU_CTX_F_SEGS		BIT(0)
