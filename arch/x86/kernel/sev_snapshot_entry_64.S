@@ -20,29 +20,11 @@
 	.extern sev_snapshot_iret_from_ptregs
 	.extern sev_snapshot_sysret_from_ptregs
 	.extern swapgs_restore_regs_and_return_to_usermode
-	.extern sev_snapshot_restore_bridge_l2e_va
 	.extern sev_snapshot_restore_from_mailbox
 
 SYM_CODE_START(sev_snapshot_resume_from_ptregs)
 	movq	%rdi, %rsp
 	UNWIND_HINT_REGS
-
-	/* Restore the bridge L2E before returning to the restored context. */
-	movq	sev_snapshot_restore_bridge_l2e_va(%rip), %rax
-	testq	%rax, %rax
-	jz	.Lsev_snapshot_no_bridge_l2e_restore
-	movq	(%rax), %rcx
-	testq	%rcx, %rcx
-	jz	.Lsev_snapshot_no_bridge_l2e_restore
-	movq	8(%rax), %rdx
-	testq	%rdx, %rdx
-	jz	.Lsev_snapshot_no_bridge_l2e_restore
-	movabsq	$__PAGE_OFFSET_BASE_L4, %rax
-	addq	%rax, %rcx
-	movq	%rdx, (%rcx)
-	movq	%cr3, %rax
-	movq	%rax, %cr3
-.Lsev_snapshot_no_bridge_l2e_restore:
 
 	testb	$3, CS(%rsp)
 	jz	.Lsev_snapshot_restore_to_kernel

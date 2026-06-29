@@ -373,7 +373,6 @@
 449	common	futex_waitv		sys_futex_waitv
 450	common	set_mempolicy_home_node	sys_set_mempolicy_home_node
 451	64	snapshot_enter		sys_snapshot_enter
-452	64	snapshot_online_secondary_cpus	sys_snapshot_online_secondary_cpus
 453	64	severifast_seed_input_key	sys_severifast_seed_input_key
 454	64	severifast_shadow_crypto	sys_severifast_shadow_crypto
 

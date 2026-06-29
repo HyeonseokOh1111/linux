@@ -84,7 +84,6 @@
 #define SEV_SNAPSHOT_CONTROL_SHARED_SIZE	SZ_2M
 #define SEV_SNAPSHOT_ATTESTATION_REQUEST_OFFSET \
 	(SEV_SNAPSHOT_CONTROL_SHARED_SIZE - (2 * PAGE_SIZE))
-#define SEV_SNAPSHOT_RESTORE_SHARED_BRIDGE_L2E_OFFSET	0x0E40ULL
 #define SEV_SNAPSHOT_REQUEST_HOST_EVENT_SIGNAL	0x0051000000000014ULL
 #define SEV_SNAPSHOT_APIC_DIVISOR		16
 #define SEV_SNAPSHOT_FALLBACK_AP_TMICT		0x3d091U
@@ -102,7 +101,6 @@ static DEFINE_MUTEX(sev_snapshot_transport_lock);
 static bool sev_snapshot_shared_ready;
 static DEFINE_PER_CPU(struct task_struct *, sev_snapshot_pending_task);
 static void *sev_snapshot_attestation_request_page_va;
-u64 *sev_snapshot_restore_bridge_l2e_va;
 static bool sev_snapshot_warned_extent_capacity;
 bool sev_snapshot_resume_in_progress;
 static cpumask_t sev_snapshot_saved_cpus_allowed;
@@ -270,12 +268,6 @@ static void sev_snapshot_clear_idle_polling_flags(void)
 		return;
 
 	smp_mb__after_atomic();
-}
-
-long sev_snapshot_online_secondary_cpus(void)
-{
-	sev_snapshot_restore_current_affinity();
-	return 0;
 }
 
 static void sev_snapshot_abort_capture_setup(void)
@@ -766,9 +758,6 @@ static void sev_snapshot_map_request_page_locked(void)
 	if (!sev_snapshot_attestation_request_page_va)
 		return;
 
-	sev_snapshot_restore_bridge_l2e_va =
-		(u64 *)((u8 *)sev_snapshot_attestation_request_page_va +
-			SEV_SNAPSHOT_RESTORE_SHARED_BRIDGE_L2E_OFFSET);
 }
 
 void sev_snapshot_track_page_state(unsigned long addr, unsigned int npages,

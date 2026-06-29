@@ -47,7 +47,6 @@ void __init sme_encrypt_kernel(struct boot_params *bp);
 void __init sme_enable(struct boot_params *bp);
 
 long sev_snapshot_arm(void);
-long sev_snapshot_online_secondary_cpus(void);
 void sev_snapshot_finalize_user_return(struct pt_regs *regs);
 
 int __init early_set_memory_decrypted(unsigned long vaddr, unsigned long size);
@@ -81,7 +80,6 @@ static inline void __init sev_mailbox_reserve_from_setup_data(struct boot_params
 static inline void __init sme_encrypt_kernel(struct boot_params *bp) { }
 static inline void __init sme_enable(struct boot_params *bp) { }
 static inline long sev_snapshot_arm(void) { return -EOPNOTSUPP; }
-static inline long sev_snapshot_online_secondary_cpus(void) { return -EOPNOTSUPP; }
 static inline void sev_snapshot_finalize_user_return(struct pt_regs *regs) {}
 
 static inline void sev_es_init_vc_handling(void) { }
