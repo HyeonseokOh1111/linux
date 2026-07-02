@@ -109,12 +109,13 @@ static unsigned int sev_snapshot_restore_mode = SEV_SNAPSHOT_RESTORE_MODE_SINGLE
 static atomic_t sev_snapshot_v2_ap_ready = ATOMIC_INIT(0);
 static atomic_t sev_snapshot_v2_ap_error = ATOMIC_INIT(0);
 static atomic_t sev_snapshot_v2_ap_request_epoch = ATOMIC_INIT(0);
+static u32 sev_snapshot_v2_ap_cpu_count;
 static struct sev_snapshot_mailbox_v2 *sev_snapshot_v2_ap_mailbox;
-static struct task_struct *sev_snapshot_v2_ap_task;
+static struct task_struct *sev_snapshot_v2_ap_tasks[SEV_SNAPSHOT_V2_MAX_CPUS];
 static bool sev_snapshot_v2_ap_restore_escape;
 static DEFINE_MUTEX(sev_snapshot_v2_ap_task_lock);
 static DECLARE_WAIT_QUEUE_HEAD(sev_snapshot_v2_ap_waitq);
-static struct pt_regs sev_snapshot_v2_ap_regs;
+static struct pt_regs sev_snapshot_v2_ap_regs[SEV_SNAPSHOT_V2_MAX_CPUS];
 /* Rollback note: disable these hooks together with Firecracker host replay re-enablement. */
 static bool sev_snapshot_virtio_devices_frozen;
 unsigned long sev_snapshot_restore_user_return_sp0;
@@ -147,6 +148,13 @@ static __always_inline void sev_snapshot_restore_debug_code(u8 code)
 	VMGEXIT();
 	native_wrmsrl(MSR_AMD64_SEV_ES_GHCB, ghcb_msr);
 	local_irq_restore(flags);
+}
+
+static __always_inline void sev_snapshot_restore_cpu_debug_code(u8 base,
+								u64 cpu)
+{
+	if (cpu < 2)
+		sev_snapshot_restore_debug_code(base + (u8)cpu);
 }
 
 static int __init sev_snapshot_restore_mode_setup(char *arg)
@@ -182,7 +190,7 @@ static __always_inline struct sev_snapshot_mailbox *sev_snapshot_restore_mailbox
 static __always_inline u8 *sev_snapshot_restore_gdt_page_for_cpu(unsigned int cpu)
 {
 	if (cpu >= SEV_SNAPSHOT_V2_MAX_CPUS)
-		cpu = 0;
+		sev_snapshot_restore_fault();
 	return sev_snapshot_restore_gdt_pages[cpu];
 }
 
@@ -843,6 +851,11 @@ static void sev_snapshot_fill_context(struct sev_snapshot_cpu_context *ctx,
 				      const struct pt_regs *regs,
 				      bool capture_xsave)
 {
+	unsigned int cpu = smp_processor_id();
+
+	if (cpu >= SEV_SNAPSHOT_V2_MAX_CPUS)
+		sev_snapshot_restore_fault();
+
 	memset(ctx, 0, sizeof(*ctx));
 
 	ctx->context_size = sizeof(*ctx);
@@ -876,7 +889,7 @@ static void sev_snapshot_fill_context(struct sev_snapshot_cpu_context *ctx,
 	ctx->valid_flags |= SEV_SNAPSHOT_CPU_CTX_F_EFER;
 
 	native_store_gdt(&ctx->gdt_desc);
-	memcpy(ctx->gdt_copy, get_cpu_gdt_rw(smp_processor_id()),
+	memcpy(ctx->gdt_copy, get_cpu_gdt_rw(cpu),
 	       min_t(size_t, sizeof(ctx->gdt_copy),
 		     (size_t)ctx->gdt_desc.size + 1));
 	store_idt(&ctx->idt);
@@ -887,11 +900,10 @@ static void sev_snapshot_fill_context(struct sev_snapshot_cpu_context *ctx,
 	ctx->xcr0 = xgetbv(XCR_XFEATURE_ENABLED_MASK);
 	ctx->valid_flags |= SEV_SNAPSHOT_CPU_CTX_F_XSAVE_META;
 	ctx->restore_gdt_page_va =
-		(u64)sev_snapshot_restore_gdt_page_for_cpu(smp_processor_id());
+		(u64)sev_snapshot_restore_gdt_page_for_cpu(cpu);
 	ctx->restore_gdt_page_pa =
 		__pa_symbol(sev_snapshot_restore_gdt_pages) +
-		(u64)min_t(unsigned int, smp_processor_id(),
-			   SEV_SNAPSHOT_V2_MAX_CPUS - 1) * PAGE_SIZE;
+		(u64)cpu * PAGE_SIZE;
 	ctx->restore_from_mailbox_rip = (u64)sev_snapshot_restore_from_mailbox;
 #ifdef CONFIG_X86_64
 	ctx->hardirq_stack_ptr = (u64)this_cpu_read(pcpu_hot.hardirq_stack_ptr);
@@ -962,10 +974,33 @@ static bool sev_snapshot_multi_vcpu_restore_enabled(void)
 	       SEV_SNAPSHOT_RESTORE_MODE_MULTI_VCPU;
 }
 
+static bool sev_snapshot_v2_cpu_count_valid(u32 cpu_count)
+{
+	return cpu_count >= SEV_SNAPSHOT_V2_MIN_CPUS &&
+	       cpu_count <= SEV_SNAPSHOT_V2_MAX_CPUS;
+}
+
+static bool sev_snapshot_v2_online_cpus_match(u32 cpu_count)
+{
+	u32 cpu;
+
+	if (!sev_snapshot_v2_cpu_count_valid(cpu_count))
+		return false;
+	if (num_online_cpus() != cpu_count)
+		return false;
+
+	for (cpu = 0; cpu < cpu_count; cpu++) {
+		if (!cpu_online(cpu))
+			return false;
+	}
+
+	return true;
+}
+
 static u32 sev_snapshot_restore_cpu_count(void)
 {
 	return sev_snapshot_multi_vcpu_restore_enabled() ?
-		       SEV_SNAPSHOT_V2_MAX_CPUS :
+		       num_online_cpus() :
 		       SEV_SNAPSHOT_V2_MIN_CPUS;
 }
 
@@ -1132,18 +1167,21 @@ static void sev_snapshot_capture_secondary_cpu_v2(void)
 {
 	struct sev_snapshot_mailbox_v2 *mailbox =
 		READ_ONCE(sev_snapshot_v2_ap_mailbox);
-	struct pt_regs *regs = &sev_snapshot_v2_ap_regs;
+	struct pt_regs *regs;
+	u32 cpu_count = READ_ONCE(sev_snapshot_v2_ap_cpu_count);
 	unsigned int cpu = raw_smp_processor_id();
 	unsigned long flags;
 
-	if (!mailbox || cpu != 1) {
-		pr_warn("multi-vCPU AP rendezvous capture failed: cpu=%u mailbox=%px\n",
-			cpu, mailbox);
+	if (!mailbox || !sev_snapshot_v2_cpu_count_valid(cpu_count) ||
+	    cpu == 0 || cpu >= cpu_count) {
+		pr_warn("multi-vCPU AP rendezvous capture failed: cpu=%u cpu_count=%u mailbox=%px\n",
+			cpu, cpu_count, mailbox);
 		atomic_set(&sev_snapshot_v2_ap_error, 1);
 		atomic_inc(&sev_snapshot_v2_ap_ready);
 		return;
 	}
 
+	regs = &sev_snapshot_v2_ap_regs[cpu];
 	preempt_disable();
 	/*
 	 * This rendezvous runs from a kernel thread.  If the scheduler left the
@@ -1158,16 +1196,14 @@ static void sev_snapshot_capture_secondary_cpu_v2(void)
 	sev_snapshot_store_current_kernel_ptregs(regs,
 						 (unsigned long)&&restore_continue);
 
-	sev_snapshot_fill_topology(mailbox, SEV_SNAPSHOT_V2_MAX_CPUS, 1, cpu);
+	sev_snapshot_fill_topology(mailbox, cpu_count, cpu, cpu);
 	/*
-	 * CPU1 checkpoints from this cooperative kernel thread. Capture the
+	 * APs checkpoint from cooperative kernel threads. Capture the
 	 * hardware XSAVE image as part of the guest-owned context so the runtime
 	 * can validate and replay the AP restore state instead of synthesizing it.
 	 */
 	sev_snapshot_fill_context(
-		sev_snapshot_mailbox_v2_cpu_context(mailbox,
-						    SEV_SNAPSHOT_V2_MAX_CPUS,
-						    1),
+		sev_snapshot_mailbox_v2_cpu_context(mailbox, cpu_count, cpu),
 		regs, true);
 	sev_snapshot_suspend_local_tick();
 	smp_wmb();
@@ -1209,29 +1245,29 @@ static int sev_snapshot_v2_ap_thread_fn(void *unused)
 	return 0;
 }
 
-static int sev_snapshot_v2_ensure_ap_thread(void)
+static int sev_snapshot_v2_ensure_ap_thread(unsigned int cpu)
 {
 	struct task_struct *task;
 	int ret = 0;
 
-	if (!cpu_online(1))
+	if (cpu == 0 || cpu >= SEV_SNAPSHOT_V2_MAX_CPUS || !cpu_online(cpu))
 		return -EINVAL;
 
-	if (READ_ONCE(sev_snapshot_v2_ap_task))
+	if (READ_ONCE(sev_snapshot_v2_ap_tasks[cpu]))
 		return 0;
 
 	mutex_lock(&sev_snapshot_v2_ap_task_lock);
-	if (READ_ONCE(sev_snapshot_v2_ap_task))
+	if (READ_ONCE(sev_snapshot_v2_ap_tasks[cpu]))
 		goto out;
 
-	task = kthread_create_on_cpu(sev_snapshot_v2_ap_thread_fn, NULL, 1,
+	task = kthread_create_on_cpu(sev_snapshot_v2_ap_thread_fn, NULL, cpu,
 				     "sev_snapshot_v2_ap");
 	if (IS_ERR(task)) {
 		ret = PTR_ERR(task);
 		goto out;
 	}
 
-	WRITE_ONCE(sev_snapshot_v2_ap_task, task);
+	WRITE_ONCE(sev_snapshot_v2_ap_tasks[cpu], task);
 	wake_up_process(task);
 
 out:
@@ -1239,39 +1275,64 @@ out:
 	return ret;
 }
 
-static long sev_snapshot_rendezvous_secondary_cpu_v2(
-	struct sev_snapshot_mailbox_v2 *mailbox)
+static int sev_snapshot_v2_ensure_ap_threads(u32 cpu_count)
 {
-	unsigned int wait;
-	struct task_struct *task;
+	u32 cpu;
+	int ret;
 
-	if (num_online_cpus() != SEV_SNAPSHOT_V2_MAX_CPUS || !cpu_online(1))
+	if (!sev_snapshot_v2_online_cpus_match(cpu_count) ||
+	    cpu_count <= SEV_SNAPSHOT_V2_MIN_CPUS)
 		return -EINVAL;
+
+	for (cpu = 1; cpu < cpu_count; cpu++) {
+		ret = sev_snapshot_v2_ensure_ap_thread(cpu);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static long sev_snapshot_rendezvous_secondary_cpu_v2(
+	struct sev_snapshot_mailbox_v2 *mailbox, u32 cpu_count)
+{
+	int expected_ready = (int)cpu_count - 1;
+	u32 cpu;
+	unsigned int wait;
+
+	if (!mailbox || !sev_snapshot_v2_online_cpus_match(cpu_count) ||
+	    cpu_count <= SEV_SNAPSHOT_V2_MIN_CPUS)
+		return -EINVAL;
+
+	for (cpu = 1; cpu < cpu_count; cpu++) {
+		if (!READ_ONCE(sev_snapshot_v2_ap_tasks[cpu]))
+			return -ENODEV;
+	}
 
 	atomic_set(&sev_snapshot_v2_ap_ready, 0);
 	atomic_set(&sev_snapshot_v2_ap_error, 0);
+	WRITE_ONCE(sev_snapshot_v2_ap_cpu_count, cpu_count);
 	WRITE_ONCE(sev_snapshot_v2_ap_mailbox, mailbox);
 	smp_wmb();
 
-	task = READ_ONCE(sev_snapshot_v2_ap_task);
-	if (!task)
-		return -ENODEV;
-
 	atomic_inc(&sev_snapshot_v2_ap_request_epoch);
 	wake_up_interruptible(&sev_snapshot_v2_ap_waitq);
-	wake_up_process(task);
+	for (cpu = 1; cpu < cpu_count; cpu++)
+		wake_up_process(READ_ONCE(sev_snapshot_v2_ap_tasks[cpu]));
 
 	for (wait = 0; wait < 5000; wait++) {
-		if (atomic_read(&sev_snapshot_v2_ap_ready))
+		if (atomic_read(&sev_snapshot_v2_ap_ready) >= expected_ready)
 			break;
 		usleep_range(100, 200);
 	}
-	if (!atomic_read(&sev_snapshot_v2_ap_ready)) {
+	if (atomic_read(&sev_snapshot_v2_ap_ready) < expected_ready) {
 		WRITE_ONCE(sev_snapshot_v2_ap_mailbox, NULL);
+		WRITE_ONCE(sev_snapshot_v2_ap_cpu_count, 0);
 		return -ETIMEDOUT;
 	}
 	if (atomic_read(&sev_snapshot_v2_ap_error)) {
 		WRITE_ONCE(sev_snapshot_v2_ap_mailbox, NULL);
+		WRITE_ONCE(sev_snapshot_v2_ap_cpu_count, 0);
 		return -EIO;
 	}
 
@@ -1298,13 +1359,19 @@ static long sev_snapshot_capture_final(const struct pt_regs *regs)
 		return -EINVAL;
 
 	cpu_count = sev_snapshot_restore_cpu_count();
+	if (!sev_snapshot_v2_online_cpus_match(cpu_count) ||
+	    (sev_snapshot_multi_vcpu_restore_enabled() &&
+	     cpu_count <= SEV_SNAPSHOT_V2_MIN_CPUS))
+		return -EINVAL;
+
 	mailbox_v2 = (struct sev_snapshot_mailbox_v2 *)mailbox;
 	sev_snapshot_init_mailbox_v2(mailbox_v2, cpu_count);
 	ret = sev_snapshot_freeze_virtio_devices();
 	if (ret)
 		return ret;
 	if (cpu_count > SEV_SNAPSHOT_V2_MIN_CPUS) {
-		ret = sev_snapshot_rendezvous_secondary_cpu_v2(mailbox_v2);
+		ret = sev_snapshot_rendezvous_secondary_cpu_v2(mailbox_v2,
+							       cpu_count);
 		if (ret)
 			return ret;
 	}
@@ -1327,6 +1394,7 @@ static long sev_snapshot_capture_final(const struct pt_regs *regs)
 
 long sev_snapshot_arm(void)
 {
+	u32 cpu_count;
 	long ret;
 
 	ret = sev_snapshot_pin_current_to_boot_cpu();
@@ -1335,18 +1403,19 @@ long sev_snapshot_arm(void)
 		return ret;
 	}
 
+	cpu_count = sev_snapshot_restore_cpu_count();
 	if (!sev_snapshot_multi_vcpu_restore_enabled()) {
-		if (num_online_cpus() != SEV_SNAPSHOT_V2_MIN_CPUS ||
-		    !cpu_online(0)) {
+		if (!sev_snapshot_v2_online_cpus_match(cpu_count)) {
 			sev_snapshot_abort_capture_setup();
 			return -EINVAL;
 		}
-	} else if (num_online_cpus() != SEV_SNAPSHOT_V2_MAX_CPUS ||
-		   !cpu_online(0) || !cpu_online(1)) {
-		sev_snapshot_abort_capture_setup();
-		return -EINVAL;
 	} else {
-		ret = sev_snapshot_v2_ensure_ap_thread();
+		if (!sev_snapshot_v2_online_cpus_match(cpu_count) ||
+		    cpu_count <= SEV_SNAPSHOT_V2_MIN_CPUS) {
+			sev_snapshot_abort_capture_setup();
+			return -EINVAL;
+		}
+		ret = sev_snapshot_v2_ensure_ap_threads(cpu_count);
 		if (ret) {
 			sev_snapshot_abort_capture_setup();
 			return ret;
@@ -1615,6 +1684,23 @@ sev_snapshot_restore_v2_barrier(struct sev_snapshot_mailbox *mailbox)
 		(struct sev_snapshot_mailbox_v2 *)mailbox);
 }
 
+static u32 sev_snapshot_restore_v2_cpu_count(struct sev_snapshot_mailbox *mailbox)
+{
+	struct sev_snapshot_mailbox_v2 *mailbox_v2;
+	u32 cpu_count;
+
+	if (!sev_snapshot_mailbox_is_v2(mailbox))
+		sev_snapshot_restore_fault();
+
+	mailbox_v2 = (struct sev_snapshot_mailbox_v2 *)mailbox;
+	cpu_count = READ_ONCE(mailbox_v2->header.cpu_count);
+	if (cpu_count <= SEV_SNAPSHOT_V2_MIN_CPUS ||
+	    cpu_count > SEV_SNAPSHOT_V2_MAX_CPUS)
+		sev_snapshot_restore_fault();
+
+	return cpu_count;
+}
+
 static int sev_snapshot_restore_barrier_read(u32 *field)
 {
 	return atomic_read((atomic_t *)field);
@@ -1640,14 +1726,6 @@ static void sev_snapshot_restore_barrier_wait_at_least(u32 *field, int value)
 	}
 }
 
-static void sev_snapshot_restore_barrier_wait_nonzero(u32 *field)
-{
-	while (!sev_snapshot_restore_barrier_read(field)) {
-		smp_rmb();
-		barrier();
-	}
-}
-
 static void sev_snapshot_restore_barrier_wait_nonzero_irq_poll(u32 *field)
 {
 	while (!sev_snapshot_restore_barrier_read(field)) {
@@ -1659,8 +1737,10 @@ static void sev_snapshot_restore_barrier_wait_nonzero_irq_poll(u32 *field)
 
 static void sev_snapshot_restore_v2_ap_continue_after_ptregs(void)
 {
+	struct sev_snapshot_mailbox *mailbox = sev_snapshot_restore_mailbox_va();
 	struct sev_snapshot_restore_barrier *barrier =
-		sev_snapshot_restore_v2_barrier(sev_snapshot_restore_mailbox_va());
+		sev_snapshot_restore_v2_barrier(mailbox);
+	u32 cpu = raw_smp_processor_id();
 
 	sev_snapshot_restore_debug_code(0xe1);
 	kvm_sev_snapshot_restore_reinit_ap();
@@ -1669,44 +1749,48 @@ static void sev_snapshot_restore_v2_ap_continue_after_ptregs(void)
 	sev_snapshot_rearm_boot_local_apic_timer();
 	sev_snapshot_restore_debug_code(0xe5);
 
-	sev_snapshot_restore_barrier_set(&barrier->ap_continue_ready, 1);
+	sev_snapshot_restore_barrier_set(&barrier->ap_continue, cpu + 1);
+	sev_snapshot_restore_barrier_inc(&barrier->ap_continue_ready);
 }
 
 static void sev_snapshot_restore_v2_ap_wait_after_context_restore(void)
 {
+	struct sev_snapshot_mailbox *mailbox = sev_snapshot_restore_mailbox_va();
 	struct sev_snapshot_restore_barrier *barrier =
-		sev_snapshot_restore_v2_barrier(sev_snapshot_restore_mailbox_va());
+		sev_snapshot_restore_v2_barrier(mailbox);
+	u32 cpu_count = sev_snapshot_restore_v2_cpu_count(mailbox);
 
 	sev_snapshot_restore_debug_code(0xe7);
 
 	sev_snapshot_restore_barrier_inc(&barrier->resume_ready);
 	sev_snapshot_restore_barrier_wait_nonzero_irq_poll(&barrier->virtio_done);
 	sev_snapshot_restore_barrier_wait_at_least(&barrier->resume_ready,
-						   SEV_SNAPSHOT_V2_MAX_CPUS);
+						   cpu_count);
 	sev_snapshot_restore_debug_code(0xe9);
 }
 
 static void __noreturn sev_snapshot_restore_v2_ap_handoff_to_continuation(
 	struct sev_snapshot_mailbox *mailbox,
 	const struct sev_snapshot_cpu_context *ctx,
-	struct pt_regs *regs,
 	u64 restore_cpu_id)
 {
 	struct sev_snapshot_restore_barrier *barrier =
 		sev_snapshot_restore_v2_barrier(mailbox);
+	u32 cpu_count = sev_snapshot_restore_v2_cpu_count(mailbox);
 
 	sev_snapshot_restore_debug_code(0xa5);
 	sev_snapshot_restore_barrier_inc(&barrier->ready);
 	sev_snapshot_restore_barrier_wait_at_least(&barrier->ready,
-						   SEV_SNAPSHOT_V2_MAX_CPUS);
+						   cpu_count);
 	sev_snapshot_restore_debug_code(0xa7);
 
-	sev_snapshot_restore_barrier_wait_nonzero(&barrier->ap_continue);
+	sev_snapshot_restore_barrier_wait_at_least(&barrier->ap_continue,
+						   restore_cpu_id);
 	sev_snapshot_restore_debug_code(0xad);
 
 	local_irq_disable();
 	sev_snapshot_leave_irq_stack_restore_window(ctx, restore_cpu_id);
-	sev_snapshot_resume_from_ptregs(regs);
+	sev_snapshot_resume_kernel_thread_from_ptregs(&ctx->regs);
 	unreachable();
 }
 
@@ -1715,16 +1799,18 @@ static void sev_snapshot_restore_v2_bsp_barrier_before_resume(
 {
 	struct sev_snapshot_restore_barrier *barrier =
 		sev_snapshot_restore_v2_barrier(mailbox);
+	u32 cpu_count = sev_snapshot_restore_v2_cpu_count(mailbox);
 	int ret;
 
 	sev_snapshot_restore_barrier_inc(&barrier->ready);
 	sev_snapshot_restore_barrier_wait_at_least(&barrier->ready,
-						   SEV_SNAPSHOT_V2_MAX_CPUS);
+						   cpu_count);
 
 	sev_snapshot_restore_debug_code(0xe0);
 	sev_snapshot_restore_barrier_set(&barrier->ap_continue, 1);
 	sev_snapshot_restore_debug_code(0xe2);
-	sev_snapshot_restore_barrier_wait_nonzero(&barrier->ap_continue_ready);
+	sev_snapshot_restore_barrier_wait_at_least(&barrier->ap_continue_ready,
+						   cpu_count - 1);
 	sev_snapshot_restore_debug_code(0xe4);
 
 	sev_snapshot_restore_debug_code(0xe6);
@@ -1737,7 +1823,7 @@ static void sev_snapshot_restore_v2_bsp_barrier_before_resume(
 
 	sev_snapshot_restore_barrier_inc(&barrier->resume_ready);
 	sev_snapshot_restore_barrier_wait_at_least(&barrier->resume_ready,
-						   SEV_SNAPSHOT_V2_MAX_CPUS);
+						   cpu_count);
 	sev_snapshot_resume_local_tick();
 	sev_snapshot_restore_debug_code(0xed);
 	sev_snapshot_rearm_boot_local_apic_timer();
@@ -1760,7 +1846,7 @@ void __noreturn sev_snapshot_restore_from_mailbox(
 		mailbox_v2 = (struct sev_snapshot_mailbox_v2 *)mailbox;
 		restore_cpu_count = READ_ONCE(mailbox_v2->header.cpu_count);
 	}
-	sev_snapshot_restore_debug_code(0xd0 + restore_cpu_id);
+	sev_snapshot_restore_cpu_debug_code(0xd0, restore_cpu_id);
 	restore_ds = READ_ONCE(ctx->ds);
 	restore_es = READ_ONCE(ctx->es);
 	restore_fs = READ_ONCE(ctx->fs);
@@ -1779,45 +1865,45 @@ void __noreturn sev_snapshot_restore_from_mailbox(
 
 	load_idt(&ctx->idt);
 	sev_snapshot_restore_tr_from_gdt(&restore_gdt_desc, restore_tss);
-	sev_snapshot_restore_debug_code(0xd2 + restore_cpu_id);
+	sev_snapshot_restore_cpu_debug_code(0xd2, restore_cpu_id);
 
 	regs = (struct pt_regs *)(unsigned long)ctx->kernel_regs_ptr;
 	sev_snapshot_restore_copy(regs, &ctx->regs, sizeof(*regs));
 	regs->flags &= ~X86_EFLAGS_TF;
 	if (user_mode(regs))
 		regs->flags |= X86_EFLAGS_IF;
-	sev_snapshot_restore_debug_code(0xd8 + restore_cpu_id);
+	sev_snapshot_restore_cpu_debug_code(0xd8, restore_cpu_id);
 
 	write_cr0(ctx->cr0);
 	write_cr2(ctx->cr2);
 	wrmsrl(MSR_EFER, ctx->efer);
-	sev_snapshot_restore_debug_code(0xc3 + restore_cpu_id);
+	sev_snapshot_restore_cpu_debug_code(0xc3, restore_cpu_id);
 
 	sev_snapshot_register_runtime_ghcb_cpu(restore_cpu_id);
-	sev_snapshot_restore_debug_code(0xc5 + restore_cpu_id);
+	sev_snapshot_restore_cpu_debug_code(0xc5, restore_cpu_id);
 	if (!sev_snapshot_negotiate_runtime_ghcb_protocol())
 		sev_snapshot_restore_fault();
-	sev_snapshot_restore_debug_code(0xc7 + restore_cpu_id);
+	sev_snapshot_restore_cpu_debug_code(0xc7, restore_cpu_id);
 
 	wrmsrl(MSR_FS_BASE, ctx->fs_base);
 	wrmsrl(MSR_GS_BASE, ctx->kernel_gs_base);
 	wrmsrl(MSR_KERNEL_GS_BASE, ctx->user_gs_base);
-	sev_snapshot_restore_debug_code(0xc9 + restore_cpu_id);
+	sev_snapshot_restore_cpu_debug_code(0xc9, restore_cpu_id);
 	native_write_cr4(ctx->cr4);
-	sev_snapshot_restore_debug_code(0xb4 + restore_cpu_id);
+	sev_snapshot_restore_cpu_debug_code(0xb4, restore_cpu_id);
 	sev_snapshot_enter_irq_stack_restore_window(ctx, restore_cpu_id);
-	sev_snapshot_restore_debug_code(0xcb + restore_cpu_id);
+	sev_snapshot_restore_cpu_debug_code(0xcb, restore_cpu_id);
 	syscall_init();
 	write_pkru(ctx->pkru);
-	sev_snapshot_restore_debug_code(0xcd + restore_cpu_id);
+	sev_snapshot_restore_cpu_debug_code(0xcd, restore_cpu_id);
 
 	sev_snapshot_restore_xsave_state(mailbox, ctx, restore_cpu_id);
 	if (sev_snapshot_mailbox_is_v2(mailbox))
-		sev_snapshot_restore_debug_code(0xce + restore_cpu_id);
+		sev_snapshot_restore_cpu_debug_code(0xce, restore_cpu_id);
 
 	sev_snapshot_install_sp0_scratch_stack();
 	if (sev_snapshot_mailbox_is_v2(mailbox))
-		sev_snapshot_restore_debug_code(0xa8 + restore_cpu_id);
+		sev_snapshot_restore_cpu_debug_code(0xa8, restore_cpu_id);
 
 	if (restore_cpu_id == 0) {
 		if (sev_snapshot_mailbox_is_v2(mailbox))
@@ -1841,9 +1927,9 @@ void __noreturn sev_snapshot_restore_from_mailbox(
 	    restore_cpu_count > SEV_SNAPSHOT_V2_MIN_CPUS) {
 		if (restore_cpu_id == 0)
 			sev_snapshot_restore_v2_bsp_barrier_before_resume(mailbox);
-		else
-			sev_snapshot_restore_v2_ap_handoff_to_continuation(
-				mailbox, ctx, regs, restore_cpu_id);
+			else
+				sev_snapshot_restore_v2_ap_handoff_to_continuation(
+					mailbox, ctx, restore_cpu_id);
 	} else if (sev_snapshot_restore_virtio_devices()) {
 		sev_snapshot_restore_fault();
 	}

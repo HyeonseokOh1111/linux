@@ -73,7 +73,7 @@ struct sev_snapshot_mailbox {
 #define SEV_SNAPSHOT_RESTORE_MODE_SINGLE_VCPU	0U
 #define SEV_SNAPSHOT_RESTORE_MODE_MULTI_VCPU	1U
 #define SEV_SNAPSHOT_V2_MIN_CPUS		1U
-#define SEV_SNAPSHOT_V2_MAX_CPUS		2U
+#define SEV_SNAPSHOT_V2_MAX_CPUS		64U
 
 struct sev_snapshot_mailbox_v2_header {
 	u32 magic;
@@ -132,6 +132,8 @@ extern void sev_snapshot_restore_entry_early(struct sev_snapshot_mailbox *mailbo
 extern void sev_snapshot_restore_from_mailbox(struct sev_snapshot_mailbox *mailbox,
 					      u64 restore_cpu_id);
 extern void sev_snapshot_resume_from_ptregs(struct pt_regs *regs);
+extern void sev_snapshot_resume_kernel_thread_from_ptregs(
+	const struct pt_regs *regs);
 
 extern bool sev_snapshot_resume_in_progress;
 

@@ -33,6 +33,40 @@ SYM_CODE_START(sev_snapshot_resume_from_ptregs)
 	jmp	restore_regs_and_return_to_kernel
 SYM_CODE_END(sev_snapshot_resume_from_ptregs)
 
+SYM_CODE_START(sev_snapshot_resume_kernel_thread_from_ptregs)
+	movq	%rdi, %r10
+
+	testb	$3, CS(%r10)
+	jz	.Lsev_snapshot_resume_kernel_thread
+	ud2
+
+.Lsev_snapshot_resume_kernel_thread:
+	movq	RSP(%r10), %rsp
+	movq	RIP(%r10), %r11
+	pushq	%r11
+
+	movq	EFLAGS(%r10), %r11
+	pushq	%r11
+	popfq
+
+	movq	R15(%r10), %r15
+	movq	R14(%r10), %r14
+	movq	R13(%r10), %r13
+	movq	R12(%r10), %r12
+	movq	RBP(%r10), %rbp
+	movq	RBX(%r10), %rbx
+	movq	R9(%r10), %r9
+	movq	R8(%r10), %r8
+	movq	RCX(%r10), %rcx
+	movq	RDX(%r10), %rdx
+	movq	RSI(%r10), %rsi
+	movq	RDI(%r10), %rdi
+	movq	RAX(%r10), %rax
+	movq	R11(%r10), %r11
+	movq	R10(%r10), %r10
+	ret
+SYM_CODE_END(sev_snapshot_resume_kernel_thread_from_ptregs)
+
 SYM_CODE_START(sev_snapshot_restore_entry_early)
 	UNWIND_HINT_END_OF_STACK
 
