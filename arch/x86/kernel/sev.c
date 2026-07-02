@@ -79,16 +79,16 @@ static struct ghcb *boot_ghcb __section(".data");
 /* Bitmap of SEV features supported by the hypervisor */
 static u64 sev_hv_features __ro_after_init;
 
-#define SEVERIFAST_INPUT_PRIVATE_KEY_LEN	32
-#define SEVERIFAST_SHADOW_CRYPTO_DECRYPT	0
-#define SEVERIFAST_SHADOW_CRYPTO_ENCRYPT	1
+#define FAASEV_INPUT_PRIVATE_KEY_LEN	32
+#define FAASEV_SHADOW_CRYPTO_DECRYPT	0
+#define FAASEV_SHADOW_CRYPTO_ENCRYPT	1
 
-static DEFINE_MUTEX(severifast_input_private_key_lock);
-static u8 severifast_input_private_key[SEVERIFAST_INPUT_PRIVATE_KEY_LEN];
-static bool severifast_input_private_key_ready;
-static u64 severifast_secrets_gpa;
+static DEFINE_MUTEX(faasev_input_private_key_lock);
+static u8 faasev_input_private_key[FAASEV_INPUT_PRIVATE_KEY_LEN];
+static bool faasev_input_private_key_ready;
+static u64 faasev_secrets_gpa;
 
-static bool severifast_buffer_is_zero(const u8 *buffer, size_t len)
+static bool faasev_buffer_is_zero(const u8 *buffer, size_t len)
 {
 	size_t index;
 
@@ -100,19 +100,19 @@ static bool severifast_buffer_is_zero(const u8 *buffer, size_t len)
 	return true;
 }
 
-static int severifast_load_input_private_key_from_secrets_locked(void)
+static int faasev_load_input_private_key_from_secrets_locked(void)
 {
 	struct snp_secrets_page_layout *layout;
-	u8 key[SEVERIFAST_INPUT_PRIVATE_KEY_LEN];
+	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN];
 	void __iomem *mem;
 
-	if (severifast_input_private_key_ready)
+	if (faasev_input_private_key_ready)
 		return 0;
 
-	if (!severifast_secrets_gpa)
+	if (!faasev_secrets_gpa)
 		return -ENOKEY;
 
-	mem = ioremap_encrypted(severifast_secrets_gpa, PAGE_SIZE);
+	mem = ioremap_encrypted(faasev_secrets_gpa, PAGE_SIZE);
 	if (!mem)
 		return -ENOMEM;
 
@@ -120,62 +120,62 @@ static int severifast_load_input_private_key_from_secrets_locked(void)
 	memcpy(key, layout->os_area.rsvd, sizeof(key));
 	iounmap(mem);
 
-	if (severifast_buffer_is_zero(key, sizeof(key))) {
+	if (faasev_buffer_is_zero(key, sizeof(key))) {
 		memzero_explicit(key, sizeof(key));
 		return -ENOKEY;
 	}
 
-	memcpy(severifast_input_private_key, key, sizeof(key));
-	severifast_input_private_key_ready = true;
+	memcpy(faasev_input_private_key, key, sizeof(key));
+	faasev_input_private_key_ready = true;
 	memzero_explicit(key, sizeof(key));
 	return 0;
 }
 
-SYSCALL_DEFINE2(severifast_seed_input_key, const u8 __user *, input_key,
+SYSCALL_DEFINE2(faasev_seed_input_key, const u8 __user *, input_key,
 		size_t, input_key_len)
 {
-	u8 key[SEVERIFAST_INPUT_PRIVATE_KEY_LEN];
+	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN];
 
 	if (input_key_len != sizeof(key))
 		return -EINVAL;
 	if (copy_from_user(key, input_key, sizeof(key)))
 		return -EFAULT;
-	if (severifast_buffer_is_zero(key, sizeof(key))) {
+	if (faasev_buffer_is_zero(key, sizeof(key))) {
 		memzero_explicit(key, sizeof(key));
 		return -EINVAL;
 	}
 
-	mutex_lock(&severifast_input_private_key_lock);
-	memcpy(severifast_input_private_key, key, sizeof(key));
-	severifast_input_private_key_ready = true;
-	mutex_unlock(&severifast_input_private_key_lock);
+	mutex_lock(&faasev_input_private_key_lock);
+	memcpy(faasev_input_private_key, key, sizeof(key));
+	faasev_input_private_key_ready = true;
+	mutex_unlock(&faasev_input_private_key_lock);
 
 	memzero_explicit(key, sizeof(key));
 	return 0;
 }
 
-SYSCALL_DEFINE2(severifast_shadow_crypto, unsigned int, operation,
+SYSCALL_DEFINE2(faasev_shadow_crypto, unsigned int, operation,
 		size_t, payload_len)
 {
 	struct crypto_aes_ctx aes_ctx;
-	u8 key[SEVERIFAST_INPUT_PRIVATE_KEY_LEN];
+	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN];
 	u8 block[AES_BLOCK_SIZE];
 	u8 output[AES_BLOCK_SIZE];
 	size_t block_count;
 	size_t index;
 	int ret;
 
-	if (operation != SEVERIFAST_SHADOW_CRYPTO_DECRYPT &&
-	    operation != SEVERIFAST_SHADOW_CRYPTO_ENCRYPT)
+	if (operation != FAASEV_SHADOW_CRYPTO_DECRYPT &&
+	    operation != FAASEV_SHADOW_CRYPTO_ENCRYPT)
 		return -EINVAL;
 	if (!payload_len)
 		return 0;
 
-	mutex_lock(&severifast_input_private_key_lock);
-	ret = severifast_load_input_private_key_from_secrets_locked();
+	mutex_lock(&faasev_input_private_key_lock);
+	ret = faasev_load_input_private_key_from_secrets_locked();
 	if (!ret)
-		memcpy(key, severifast_input_private_key, sizeof(key));
-	mutex_unlock(&severifast_input_private_key_lock);
+		memcpy(key, faasev_input_private_key, sizeof(key));
+	mutex_unlock(&faasev_input_private_key_lock);
 	if (ret)
 		return ret;
 
@@ -191,7 +191,7 @@ SYSCALL_DEFINE2(severifast_shadow_crypto, unsigned int, operation,
 		block[1] ^= (u8)(index >> 8);
 		block[2] ^= (u8)(index >> 16);
 		block[3] ^= (u8)(index >> 24);
-		if (operation == SEVERIFAST_SHADOW_CRYPTO_ENCRYPT)
+		if (operation == FAASEV_SHADOW_CRYPTO_ENCRYPT)
 			aes_encrypt(&aes_ctx, output, block);
 		else
 			aes_decrypt(&aes_ctx, output, block);
@@ -2640,7 +2640,7 @@ static int __init snp_init_platform_device(void)
 	if (!gpa)
 		return -ENODEV;
 
-	severifast_secrets_gpa = gpa;
+	faasev_secrets_gpa = gpa;
 	data.secrets_gpa = gpa;
 	if (platform_device_add_data(&sev_guest_device, &data, sizeof(data)))
 		return -ENODEV;
