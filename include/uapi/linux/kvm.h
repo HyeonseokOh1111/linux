@@ -2335,6 +2335,7 @@ struct kvm_s390_zpci_op {
 
 /* Select the VMSA associated with a VMPL before the next KVM_RUN. */
 #define KVM_SNP_SWITCH_VMPL                    _IOW(KVMIO,  0xd4, struct kvm_snp_vmpl)
+#define KVM_SNP_GET_VMPL                       _IOR(KVMIO,  0xd5, struct kvm_snp_vmpl)
 
 struct kvm_snp_vmpl {
 	__u32 vmpl;

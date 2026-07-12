@@ -4030,6 +4030,15 @@ int sev_snp_switch_vmpl(struct kvm_vcpu *vcpu, unsigned int new_vmpl)
 	return 0;
 }
 
+int sev_snp_get_vmpl(struct kvm_vcpu *vcpu, unsigned int *vmpl)
+{
+	if (!sev_snp_guest(vcpu->kvm) || !vmpl)
+		return -EINVAL;
+
+	*vmpl = to_svm(vcpu)->sev_es.snp_current_vmpl;
+	return 0;
+}
+
 static void sev_run_vmpl_vmsa(struct vcpu_svm *svm)
 {
 	struct ghcb *ghcb = svm->sev_es.ghcb;
