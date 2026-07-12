@@ -3096,7 +3096,16 @@ void sev_free_vcpu(struct kvm_vcpu *vcpu)
 	 * restored in the direct map.
 	 */
 	if (sev_snp_guest(vcpu->kvm)) {
+		unsigned int vmpl;
 		u64 pfn = __pa(svm->sev_es.vmsa) >> PAGE_SHIFT;
+
+		for (vmpl = 1; vmpl < SVM_SEV_VMPL_MAX; vmpl++) {
+			if (!VALID_PAGE(svm->sev_es.vmsa_pa[vmpl]))
+				continue;
+
+			kvm_release_pfn_dirty(__phys_to_pfn(svm->sev_es.vmsa_pa[vmpl]));
+			svm->sev_es.vmsa_pa[vmpl] = INVALID_PAGE;
+		}
 
 		if (host_rmp_make_shared(pfn, PG_LEVEL_4K, true))
 			goto skip_vmsa_free;
