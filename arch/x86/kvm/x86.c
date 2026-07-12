@@ -5973,6 +5973,23 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 		r = __set_sregs2(vcpu, u.sregs2);
 		break;
 	}
+	case KVM_SNP_SWITCH_VMPL: {
+		struct kvm_snp_vmpl params;
+
+		r = -EFAULT;
+		if (copy_from_user(&params, argp, sizeof(params)))
+			goto out;
+		if (params.flags) {
+			r = -EINVAL;
+			break;
+		}
+		if (!kvm_x86_ops.switch_vmpl) {
+			r = -EOPNOTSUPP;
+			break;
+		}
+		r = static_call(kvm_x86_switch_vmpl)(vcpu, params.vmpl);
+		break;
+	}
 	case KVM_HAS_DEVICE_ATTR:
 	case KVM_GET_DEVICE_ATTR:
 	case KVM_SET_DEVICE_ATTR:

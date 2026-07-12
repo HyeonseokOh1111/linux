@@ -2333,6 +2333,14 @@ struct kvm_s390_zpci_op {
 #define KVM_GET_SUPPORTED_MEMORY_ATTRIBUTES    _IOR(KVMIO,  0xd2, __u64)
 #define KVM_SET_MEMORY_ATTRIBUTES              _IOWR(KVMIO,  0xd3, struct kvm_memory_attributes)
 
+/* Select the VMSA associated with a VMPL before the next KVM_RUN. */
+#define KVM_SNP_SWITCH_VMPL                    _IOW(KVMIO,  0xd4, struct kvm_snp_vmpl)
+
+struct kvm_snp_vmpl {
+	__u32 vmpl;
+	__u32 flags;
+};
+
 struct kvm_memory_attributes {
 	__u64 address;
 	__u64 size;

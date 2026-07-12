@@ -1719,6 +1719,7 @@ struct kvm_x86_ops {
 	int (*vm_copy_enc_context_from)(struct kvm *kvm, unsigned int source_fd);
 	int (*vm_move_enc_context_from)(struct kvm *kvm, unsigned int source_fd);
 	void (*guest_memory_reclaimed)(struct kvm *kvm);
+	int (*switch_vmpl)(struct kvm_vcpu *vcpu, unsigned int vmpl);
 
 	int (*get_msr_feature)(struct kvm_msr_entry *entry);
 

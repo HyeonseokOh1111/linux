@@ -3296,11 +3296,16 @@ static int sev_es_validate_vmgexit(struct vcpu_svm *svm)
 		if (!ghcb_sw_scratch_is_valid(ghcb))
 			goto vmgexit_err;
 		break;
-	case SVM_VMGEXIT_AP_CREATION:
-		if (lower_32_bits(ghcb_get_sw_exit_info_1(ghcb)) != SVM_VMGEXIT_AP_DESTROY)
+	case SVM_VMGEXIT_AP_CREATION: {
+		unsigned int request;
+
+		request = lower_32_bits(ghcb_get_sw_exit_info_1(ghcb));
+		request &= ~SVM_VMGEXIT_AP_VMPL_MASK;
+		if (request != SVM_VMGEXIT_AP_DESTROY)
 			if (!ghcb_rax_is_valid(ghcb))
 				goto vmgexit_err;
 		break;
+	}
 	case SVM_VMGEXIT_NMI_COMPLETE:
 	case SVM_VMGEXIT_AP_HLT_LOOP:
 	case SVM_VMGEXIT_AP_JUMP_TABLE:
@@ -3310,6 +3315,7 @@ static int sev_es_validate_vmgexit(struct vcpu_svm *svm)
 	case SVM_VMGEXIT_PSC:
 	case SVM_VMGEXIT_GUEST_REQUEST:
 	case SVM_VMGEXIT_EXT_GUEST_REQUEST:
+	case SVM_VMGEXIT_RUN_VMPL:
 		break;
 	default:
 		reason = GHCB_ERR_INVALID_EVENT;
@@ -3753,19 +3759,19 @@ static int __sev_snp_update_protected_guest_state(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
 	kvm_pfn_t pfn;
-	hpa_t cur_pa;
+	hpa_t cur_pa, *pa;
 
 	WARN_ON(!mutex_is_locked(&svm->sev_es.snp_vmsa_mutex));
-
-	/* Save off the current VMSA PA for later checks */
-	cur_pa = svm->sev_es.vmsa_pa;
 
 	/* Mark the vCPU as offline and not runnable */
 	vcpu->arch.pv.pv_unhalted = false;
 	vcpu->arch.mp_state = KVM_MP_STATE_HALTED;
 
+	pa = &svm->sev_es.vmsa_pa[svm->sev_es.snp_target_vmpl];
+	cur_pa = *pa;
+
 	/* Clear use of the VMSA */
-	svm->sev_es.vmsa_pa = INVALID_PAGE;
+	*pa = INVALID_PAGE;
 	svm->vmcb->control.vmsa_pa = INVALID_PAGE;
 
 	if (cur_pa != __pa(svm->sev_es.vmsa) && VALID_PAGE(cur_pa)) {
@@ -3777,24 +3783,34 @@ static int __sev_snp_update_protected_guest_state(struct kvm_vcpu *vcpu)
 		kvm_release_pfn_dirty(__phys_to_pfn(cur_pa));
 	}
 
-	if (VALID_PAGE(svm->sev_es.snp_vmsa_gpa)) {
+	if (VALID_PAGE(svm->sev_es.snp_vmsa[svm->sev_es.snp_target_vmpl].gpa)) {
 		/*
 		 * The VMSA is referenced by the hypervisor physical address,
 		 * so retrieve the PFN and ensure it is restricted memory.
 		 */
-		pfn = gfn_to_pfn_restricted(vcpu->kvm, gpa_to_gfn(svm->sev_es.snp_vmsa_gpa));
+		pfn = gfn_to_pfn_restricted(vcpu->kvm,
+					    gpa_to_gfn(svm->sev_es.snp_vmsa[svm->sev_es.snp_target_vmpl].gpa));
 		if (!VALID_PAGE(pfn) || is_error_pfn(pfn))
 			return -EINVAL;
 
 		/* Use the new VMSA */
-		svm->sev_es.vmsa_pa = pfn_to_hpa(pfn);
-		svm->vmcb->control.vmsa_pa = svm->sev_es.vmsa_pa;
+		*pa = pfn_to_hpa(pfn);
+		svm->vmcb->control.vmsa_pa = *pa;
 
 		/* Mark the vCPU as runnable */
 		vcpu->arch.pv.pv_unhalted = false;
 		vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
 
-		svm->sev_es.snp_vmsa_gpa = INVALID_PAGE;
+		svm->sev_es.snp_vmsa[svm->sev_es.snp_target_vmpl].gpa = INVALID_PAGE;
+	}
+
+	if (svm->sev_es.snp_current_vmpl != svm->sev_es.snp_target_vmpl) {
+		sev_es_unmap_ghcb(svm);
+		svm->sev_es.ghcb_gpa[svm->sev_es.snp_current_vmpl] =
+			svm->vmcb->control.ghcb_gpa;
+		svm->vmcb->control.ghcb_gpa =
+			svm->sev_es.ghcb_gpa[svm->sev_es.snp_target_vmpl];
+		svm->sev_es.snp_current_vmpl = svm->sev_es.snp_target_vmpl;
 	}
 
 	/*
@@ -3809,20 +3825,22 @@ static int __sev_snp_update_protected_guest_state(struct kvm_vcpu *vcpu)
 /*
  * Invoked as part of svm_vcpu_reset() processing of an init event.
  */
-void sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu)
+bool sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
+	bool init = false;
 	int ret;
 
 	if (!sev_snp_guest(vcpu->kvm))
-		return;
+		return false;
 
 	mutex_lock(&svm->sev_es.snp_vmsa_mutex);
 
-	if (!svm->sev_es.snp_ap_create)
+	if (!svm->sev_es.snp_vmsa[svm->sev_es.snp_target_vmpl].ap_create)
 		goto unlock;
 
-	svm->sev_es.snp_ap_create = false;
+	init = true;
+	svm->sev_es.snp_vmsa[svm->sev_es.snp_target_vmpl].ap_create = false;
 
 	ret = __sev_snp_update_protected_guest_state(vcpu);
 	if (ret)
@@ -3830,6 +3848,7 @@ void sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu)
 
 unlock:
 	mutex_unlock(&svm->sev_es.snp_vmsa_mutex);
+	return init;
 }
 
 static int sev_snp_ap_creation(struct vcpu_svm *svm)
@@ -3840,11 +3859,20 @@ static int sev_snp_ap_creation(struct vcpu_svm *svm)
 	struct vcpu_svm *target_svm;
 	unsigned int request;
 	unsigned int apic_id;
+	unsigned int vmpl;
 	bool kick;
 	int ret;
 
 	request = lower_32_bits(svm->vmcb->control.exit_info_1);
 	apic_id = upper_32_bits(svm->vmcb->control.exit_info_1);
+	vmpl = (request & SVM_VMGEXIT_AP_VMPL_MASK) >> SVM_VMGEXIT_AP_VMPL_SHIFT;
+	request &= ~SVM_VMGEXIT_AP_VMPL_MASK;
+
+	if (vmpl >= SVM_SEV_VMPL_MAX) {
+		vcpu_unimpl(vcpu, "vmgexit: invalid VMPL level [%u] from guest\n", vmpl);
+		return -EINVAL;
+	}
+	vmpl = array_index_nospec(vmpl, SVM_SEV_VMPL_MAX);
 
 	/* Validate the APIC ID */
 	target_vcpu = kvm_get_vcpu_by_id(vcpu->kvm, apic_id);
@@ -3867,8 +3895,15 @@ static int sev_snp_ap_creation(struct vcpu_svm *svm)
 
 	mutex_lock(&target_svm->sev_es.snp_vmsa_mutex);
 
-	target_svm->sev_es.snp_vmsa_gpa = INVALID_PAGE;
-	target_svm->sev_es.snp_ap_create = true;
+	target_svm->sev_es.snp_vmsa[vmpl].gpa = INVALID_PAGE;
+	target_svm->sev_es.snp_vmsa[vmpl].ap_create = true;
+
+	if (vmpl == SVM_SEV_VMPL0 &&
+	    (vcpu == target_vcpu ||
+	     svm->sev_es.vmsa_pa[SVM_SEV_VMPL0] != svm->vmcb->control.vmsa_pa)) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	/* Interrupt injection mode shouldn't change for AP creation */
 	if (request < SVM_VMGEXIT_AP_DESTROY) {
@@ -3911,7 +3946,9 @@ static int sev_snp_ap_creation(struct vcpu_svm *svm)
 			goto out;
 		}
 
-		target_svm->sev_es.snp_vmsa_gpa = svm->vmcb->control.exit_info_2;
+		target_svm->sev_es.snp_target_vmpl = vmpl;
+		target_svm->sev_es.snp_vmsa[vmpl].gpa =
+			svm->vmcb->control.exit_info_2 & PAGE_MASK;
 		break;
 	case SVM_VMGEXIT_AP_DESTROY:
 		break;
@@ -3934,6 +3971,68 @@ out:
 	mutex_unlock(&target_svm->sev_es.snp_vmsa_mutex);
 
 	return ret;
+}
+
+int sev_snp_switch_vmpl(struct kvm_vcpu *vcpu, unsigned int new_vmpl)
+{
+	struct vcpu_svm *svm = to_svm(vcpu);
+	struct vmpl_switch_sa *old_vmpl_sa;
+	struct vmpl_switch_sa *new_vmpl_sa;
+	unsigned int old_vmpl;
+
+	if (!sev_snp_guest(vcpu->kvm) || new_vmpl >= SVM_SEV_VMPL_MAX)
+		return -EINVAL;
+	new_vmpl = array_index_nospec(new_vmpl, SVM_SEV_VMPL_MAX);
+
+	old_vmpl = svm->sev_es.snp_current_vmpl;
+	svm->sev_es.snp_target_vmpl = new_vmpl;
+	if (new_vmpl == old_vmpl || sev_snp_init_protected_guest_state(vcpu))
+		return 0;
+
+	if (!VALID_PAGE(svm->sev_es.vmsa_pa[new_vmpl]))
+		return -EINVAL;
+
+	sev_es_unmap_ghcb(svm);
+	svm->sev_es.ghcb_gpa[old_vmpl] = svm->vmcb->control.ghcb_gpa;
+
+	old_vmpl_sa = &svm->sev_es.vssa[old_vmpl];
+	old_vmpl_sa->exit_int_info = svm->vmcb->control.exit_int_info;
+	old_vmpl_sa->exit_int_info_err = svm->vmcb->control.exit_int_info_err;
+	old_vmpl_sa->cr0 = vcpu->arch.cr0;
+	old_vmpl_sa->cr2 = vcpu->arch.cr2;
+	old_vmpl_sa->cr4 = vcpu->arch.cr4;
+	old_vmpl_sa->cr8 = vcpu->arch.cr8;
+	old_vmpl_sa->efer = vcpu->arch.efer;
+
+	svm->vmcb->control.vmsa_pa = svm->sev_es.vmsa_pa[new_vmpl];
+	svm->vmcb->control.ghcb_gpa = svm->sev_es.ghcb_gpa[new_vmpl];
+
+	new_vmpl_sa = &svm->sev_es.vssa[new_vmpl];
+	svm->vmcb->control.exit_int_info = new_vmpl_sa->exit_int_info;
+	svm->vmcb->control.exit_int_info_err = new_vmpl_sa->exit_int_info_err;
+	vcpu->arch.cr0 = new_vmpl_sa->cr0;
+	vcpu->arch.cr2 = new_vmpl_sa->cr2;
+	vcpu->arch.cr4 = new_vmpl_sa->cr4;
+	vcpu->arch.cr8 = new_vmpl_sa->cr8;
+	vcpu->arch.efer = new_vmpl_sa->efer;
+	svm->sev_es.snp_current_vmpl = new_vmpl;
+	vmcb_mark_all_dirty(svm->vmcb);
+
+	return 0;
+}
+
+static void sev_run_vmpl_vmsa(struct vcpu_svm *svm)
+{
+	struct ghcb *ghcb = svm->sev_es.ghcb;
+	unsigned int vmpl;
+
+	ghcb_set_sw_exit_info_1(ghcb, 0);
+	ghcb_set_sw_exit_info_2(ghcb, 0);
+	vmpl = lower_32_bits(svm->vmcb->control.exit_info_1);
+	if (sev_snp_switch_vmpl(&svm->vcpu, vmpl)) {
+		ghcb_set_sw_exit_info_1(ghcb, 2);
+		ghcb_set_sw_exit_info_2(ghcb, 0);
+	}
 }
 
 static int sev_handle_vmgexit_msr_protocol(struct vcpu_svm *svm)
@@ -4028,7 +4127,8 @@ static int sev_handle_vmgexit_msr_protocol(struct vcpu_svm *svm)
 		gfn = get_ghcb_msr_bits(svm, GHCB_MSR_GPA_VALUE_MASK,
 					GHCB_MSR_GPA_VALUE_POS);
 
-		svm->sev_es.ghcb_registered_gpa = gfn_to_gpa(gfn);
+		svm->sev_es.ghcb_registered_gpa[svm->sev_es.snp_current_vmpl] =
+			gfn_to_gpa(gfn);
 
 		set_ghcb_msr_bits(svm, gfn, GHCB_MSR_GPA_VALUE_MASK,
 				  GHCB_MSR_GPA_VALUE_POS);
@@ -4043,6 +4143,22 @@ static int sev_handle_vmgexit_msr_protocol(struct vcpu_svm *svm)
 
 		ret = -1;
 		break;
+	case GHCB_MSR_VMPL_REQ: {
+		unsigned int vmpl;
+
+		vmpl = get_ghcb_msr_bits(svm, GHCB_MSR_VMPL_LEVEL_MASK,
+					 GHCB_MSR_VMPL_LEVEL_POS);
+		set_ghcb_msr_bits(svm, 0, GHCB_MSR_VMPL_ERROR_MASK,
+				  GHCB_MSR_VMPL_ERROR_POS);
+		set_ghcb_msr_bits(svm, 0, GHCB_MSR_VMPL_RSVD_MASK,
+				  GHCB_MSR_VMPL_RSVD_POS);
+		set_ghcb_msr_bits(svm, GHCB_MSR_VMPL_RESP,
+				  GHCB_MSR_INFO_MASK, GHCB_MSR_INFO_POS);
+		if (sev_snp_switch_vmpl(vcpu, vmpl))
+			set_ghcb_msr_bits(svm, 1, GHCB_MSR_VMPL_ERROR_MASK,
+					  GHCB_MSR_VMPL_ERROR_POS);
+		break;
+	}
 	case GHCB_MSR_TERM_REQ: {
 		u64 reason_set, reason_code;
 
@@ -4211,6 +4327,10 @@ int sev_handle_vmgexit(struct kvm_vcpu *vcpu)
 
 		ret = 1;
 		break;
+	case SVM_VMGEXIT_RUN_VMPL:
+		sev_run_vmpl_vmsa(svm);
+		ret = 1;
+		break;
 	case SVM_VMGEXIT_TERM_REQUEST:
 		pr_info("SEV-ES guest requested termination: exit_info_1=%#llx, exit_info_2=%#llx\n",
 			control->exit_info_1, control->exit_info_2);
@@ -4267,7 +4387,8 @@ static void sev_es_init_vmcb(struct vcpu_svm *svm)
 	 * An SEV-ES guest requires a VMSA area that is a separate from the
 	 * VMCB page.
 	 */
-	svm->vmcb->control.vmsa_pa = svm->sev_es.vmsa_pa;
+	svm->vmcb->control.vmsa_pa =
+		svm->sev_es.vmsa_pa[svm->sev_es.snp_current_vmpl];
 
 	/* Can't intercept CR register access, HV can't modify CR registers */
 	svm_clr_intercept(svm, INTERCEPT_CR0_READ);
@@ -4319,15 +4440,23 @@ void sev_init_vmcb(struct vcpu_svm *svm)
 
 void sev_es_vcpu_reset(struct vcpu_svm *svm)
 {
+	unsigned int i;
+	u64 sev_info;
+
 	/*
 	 * Set the GHCB MSR value as per the GHCB specification when emulating
 	 * vCPU RESET for an SEV-ES guest.
 	 */
-	set_ghcb_msr(svm, GHCB_MSR_SEV_INFO(GHCB_VERSION_MAX,
-					    GHCB_VERSION_MIN,
-					    sev_enc_bit));
+	sev_info = GHCB_MSR_SEV_INFO(GHCB_VERSION_MAX, GHCB_VERSION_MIN,
+				     sev_enc_bit);
+	set_ghcb_msr(svm, sev_info);
+	svm->sev_es.ghcb_gpa[SVM_SEV_VMPL0] = sev_info;
 
 	mutex_init(&svm->sev_es.snp_vmsa_mutex);
+	for (i = 1; i < SVM_SEV_VMPL_MAX; i++) {
+		svm->sev_es.vmsa_pa[i] = INVALID_PAGE;
+		svm->sev_es.ghcb_gpa[i] = sev_info;
+	}
 }
 
 void sev_es_prepare_switch_to_guest(struct sev_es_save_area *hostsa)
