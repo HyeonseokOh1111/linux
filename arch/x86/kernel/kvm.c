@@ -49,6 +49,15 @@
 DEFINE_STATIC_KEY_FALSE(kvm_async_pf_enabled);
 
 static int kvmapf = 1;
+static bool faasev_vmpl_boot;
+
+static int __init parse_faasev_vmpl(char *arg)
+{
+	faasev_vmpl_boot = !arg || !arg[0] || arg[0] == '1';
+	return 0;
+}
+
+early_param("faasev_vmpl", parse_faasev_vmpl);
 
 static int __init parse_no_kvmapf(char *arg)
 {
@@ -350,6 +359,9 @@ static notrace void kvm_guest_apic_eoi_write(u32 reg, u32 val)
 
 static void kvm_guest_cpu_init(void)
 {
+	if (faasev_vmpl_boot)
+		return;
+
 	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_INT) && kvmapf) {
 		u64 pa;
 
@@ -437,6 +449,9 @@ static void __init sev_map_percpu_data(void)
 	int cpu;
 
 	if (!cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
+		return;
+
+	if (faasev_vmpl_boot)
 		return;
 
 	for_each_possible_cpu(cpu) {
@@ -857,7 +872,7 @@ static void __init kvm_guest_init(void)
 	for (i = 0; i < KVM_TASK_SLEEP_HASHSIZE; i++)
 		raw_spin_lock_init(&async_pf_sleepers[i].lock);
 
-	if (kvm_para_has_feature(KVM_FEATURE_STEAL_TIME)) {
+	if (!faasev_vmpl_boot && kvm_para_has_feature(KVM_FEATURE_STEAL_TIME)) {
 		has_steal_clock = 1;
 		static_call_update(pv_steal_clock, kvm_steal_clock);
 
@@ -865,23 +880,23 @@ static void __init kvm_guest_init(void)
 			PV_CALLEE_SAVE(__kvm_vcpu_is_preempted);
 	}
 
-	if (kvm_para_has_feature(KVM_FEATURE_PV_EOI))
+	if (!faasev_vmpl_boot && kvm_para_has_feature(KVM_FEATURE_PV_EOI))
 		apic_set_eoi_write(kvm_guest_apic_eoi_write);
 
-	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_INT) && kvmapf) {
+	if (!faasev_vmpl_boot && kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_INT) && kvmapf) {
 		static_branch_enable(&kvm_async_pf_enabled);
 		alloc_intr_gate(HYPERVISOR_CALLBACK_VECTOR, asm_sysvec_kvm_asyncpf_interrupt);
 	}
 
 #ifdef CONFIG_SMP
-	if (pv_tlb_flush_supported()) {
+	if (!faasev_vmpl_boot && pv_tlb_flush_supported()) {
 		pv_ops.mmu.flush_tlb_multi = kvm_flush_tlb_multi;
 		pv_ops.mmu.tlb_remove_table = tlb_remove_table;
 		pr_info("KVM setup pv remote TLB flush\n");
 	}
 
 	smp_ops.smp_prepare_boot_cpu = kvm_smp_prepare_boot_cpu;
-	if (pv_sched_yield_supported()) {
+	if (!faasev_vmpl_boot && pv_sched_yield_supported()) {
 		smp_ops.send_call_func_ipi = kvm_smp_send_call_func_ipi;
 		pr_info("setup PV sched yield\n");
 	}

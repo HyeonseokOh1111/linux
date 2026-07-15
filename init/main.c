@@ -108,6 +108,24 @@
 #include <asm/sections.h>
 #include <asm/cacheflush.h>
 
+#define FAASEV_START_KERNEL_DEBUG(code)					\
+	asm volatile("pushfq\n\t"					\
+		     "pushq %%rax\n\t"					\
+		     "pushq %%rcx\n\t"					\
+		     "pushq %%rdx\n\t"					\
+		     "movl $0xc0010130, %%ecx\n\t"			\
+		     "movl $0x14, %%eax\n\t"				\
+		     "movl %0, %%edx\n\t"				\
+		     "wrmsr\n\t"					\
+		     "rep; vmmcall\n\t"					\
+		     "popq %%rdx\n\t"					\
+		     "popq %%rcx\n\t"					\
+		     "popq %%rax\n\t"					\
+		     "popfq\n\t"					\
+		     :							\
+		     : "i"((code) << 16)				\
+		     : "memory")
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/initcall.h>
 
@@ -886,15 +904,18 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	char *command_line;
 	char *after_dashes;
 
+	FAASEV_START_KERNEL_DEBUG(0x89);
 	set_task_stack_end_magic(&init_task);
 	smp_setup_processor_id();
 	debug_objects_early_init();
 	init_vmlinux_build_id();
+	FAASEV_START_KERNEL_DEBUG(0x8a);
 
 	cgroup_init_early();
 
 	local_irq_disable();
 	early_boot_irqs_disabled = true;
+	FAASEV_START_KERNEL_DEBUG(0x8b);
 
 	/*
 	 * Interrupts are still disabled. Do necessary setups, then
@@ -904,19 +925,24 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	page_address_init();
 	pr_notice("%s", linux_banner);
 	early_security_init();
+	FAASEV_START_KERNEL_DEBUG(0x8c);
 
+	FAASEV_START_KERNEL_DEBUG(0x8d);
 	setup_arch(&command_line);
+	FAASEV_START_KERNEL_DEBUG(0x8e);
 
 	setup_boot_config();
 	setup_command_line(command_line);
 	setup_nr_cpu_ids();
 	setup_per_cpu_areas();
+	FAASEV_START_KERNEL_DEBUG(0x8f);
 
 
 
 	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
 
 	boot_cpu_hotplug_init();
+	FAASEV_START_KERNEL_DEBUG(0x90);
 
 
 	pr_notice("Kernel command line: %s\n", saved_command_line);
@@ -934,9 +960,11 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	if (extra_init_args)
 		parse_args("Setting extra init args", extra_init_args,
 			   NULL, 0, -1, -1, NULL, set_init_arg);
+	FAASEV_START_KERNEL_DEBUG(0x91);
 
 	/* Architectural and non-timekeeping rng init, before allocator init */
 	random_init_early(command_line);
+	FAASEV_START_KERNEL_DEBUG(0x92);
 
 	/*
 	 * These use large bootmem allocations and must precede
@@ -949,6 +977,7 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	mm_core_init();
 	poking_init();
 	ftrace_init();
+	FAASEV_START_KERNEL_DEBUG(0x93);
 
 
 
@@ -965,6 +994,7 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	if (WARN(!irqs_disabled(),
 		 "Interrupts were enabled *very* early, fixing it\n"))
 		local_irq_disable();
+	FAASEV_START_KERNEL_DEBUG(0x94);
 	radix_tree_init();
 	maple_tree_init();
 
@@ -993,6 +1023,7 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	/* init some links before init_ISA_irqs() */
 	early_irq_init();
 	init_IRQ();
+	FAASEV_START_KERNEL_DEBUG(0x95);
 	tick_init();
 	rcu_init_nohz();
 	init_timers();
@@ -1001,6 +1032,7 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	softirq_init();
 	timekeeping_init();
 	time_init();
+	FAASEV_START_KERNEL_DEBUG(0x96);
 
 	/* This must be after timekeeping is initialized */
 	random_init();
@@ -1016,6 +1048,7 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 
 	early_boot_irqs_disabled = false;
 	local_irq_enable();
+	FAASEV_START_KERNEL_DEBUG(0x97);
 
 	kmem_cache_init_late();
 
@@ -1025,6 +1058,7 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	 * this. But we do want output early, in case something goes wrong.
 	 */
 	console_init();
+	FAASEV_START_KERNEL_DEBUG(0x98);
 	if (panic_later)
 		panic("Too many boot %s vars at `%s'", panic_later,
 		      panic_param);

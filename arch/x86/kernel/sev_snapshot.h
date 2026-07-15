@@ -149,6 +149,7 @@ void sev_snapshot_track_page_state(unsigned long addr, unsigned int npages,
 				   enum psc_op op);
 void sev_snapshot_track_psc_entries(struct psc_entry *entries,
 				    unsigned int nr_entries, enum psc_op op);
+bool sev_snapshot_range_is_mailbox_pa(unsigned long paddr, unsigned int npages);
 
 int sev_es_ghcb_vmmcall_rax(u64 rax);
 int sev_es_ghcb_msr_signal(u64 val);

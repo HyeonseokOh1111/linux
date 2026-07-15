@@ -128,6 +128,26 @@ static inline bool sev_snp_enabled(void)
 	return sev_status & MSR_AMD64_SEV_SNP_ENABLED;
 }
 
+static bool faasev_vmpl_requested(void)
+{
+	char arg[4];
+	int len;
+
+	len = cmdline_find_option("faasev_vmpl", arg, sizeof(arg));
+	if (len < 0)
+		return false;
+
+	return len == 0 || arg[0] == '1';
+}
+
+static bool faasev_vmpl_fixed_mailbox_paddr(unsigned long paddr)
+{
+	const unsigned long mailbox_start = 0x00e00000UL;
+	const unsigned long mailbox_end = mailbox_start + 0x00200000UL;
+
+	return paddr >= mailbox_start && paddr < mailbox_end;
+}
+
 static void __page_state_change(unsigned long paddr, enum psc_op op)
 {
 	u64 val;
@@ -135,6 +155,19 @@ static void __page_state_change(unsigned long paddr, enum psc_op op)
 	if (!sev_snp_enabled())
 		return;
 
+	/*
+	 * The snapshot mailbox is pre-accepted and then RMPADJUSTed by the
+	 * recorder for the lower-VMPL Linux instance.  Reissuing a host PSC to
+	 * private here performs an RMPUPDATE and drops the lower-VMPL write
+	 * permission that the recorder installed, causing VMPL1 to fault later
+	 * when it flushes snapshot metadata into the mailbox.
+	 *
+	 * The compressed boot command-line parser is not reliable early enough
+	 * for this path, so keep the fixed mailbox carve-out unconditional here.
+	 */
+	if (op == SNP_PAGE_STATE_PRIVATE &&
+	    faasev_vmpl_fixed_mailbox_paddr(paddr))
+		return;
 
 	/*
 	 * If private -> shared then invalidate the page before requesting the

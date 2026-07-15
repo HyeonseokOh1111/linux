@@ -11,6 +11,7 @@
 
 #include <linux/sched/debug.h>	/* For show_regs() */
 #include <linux/percpu-defs.h>
+#include <linux/init.h>
 #include <linux/cc_platform.h>
 #include <linux/cpu.h>
 #include <linux/printk.h>
@@ -421,6 +422,61 @@ static __always_inline void sev_es_wr_ghcb_msr(u64 val)
 	high = (u32)(val >> 32);
 
 	native_wrmsr(MSR_AMD64_SEV_ES_GHCB, low, high);
+}
+
+static __always_inline void faasev_early_ghcb_debug(u8 code)
+{
+	u64 old_ghcb_msr = sev_es_rd_ghcb_msr();
+
+	sev_es_wr_ghcb_msr(((u64)code << 48) | 0x14);
+	VMGEXIT();
+	sev_es_wr_ghcb_msr(old_ghcb_msr);
+}
+
+static bool faasev_vmpl_boot;
+
+static int __init parse_faasev_vmpl(char *arg)
+{
+	faasev_vmpl_boot = !arg || !arg[0] || arg[0] == '1';
+	return 0;
+}
+
+early_param("faasev_vmpl", parse_faasev_vmpl);
+
+static bool faasev_vmpl_requested_on_cmdline(void)
+{
+	const char option[] = "faasev_vmpl=1";
+	unsigned int pos = 0;
+
+	while (pos < COMMAND_LINE_SIZE && boot_command_line[pos]) {
+		unsigned int i = 0;
+
+		while (pos < COMMAND_LINE_SIZE && boot_command_line[pos] == ' ')
+			pos++;
+		if (pos >= COMMAND_LINE_SIZE || !boot_command_line[pos])
+			break;
+
+		while (i < sizeof(option) - 1 &&
+		       pos + i < COMMAND_LINE_SIZE &&
+		       boot_command_line[pos + i] == option[i])
+			i++;
+		if (i == sizeof(option) - 1 &&
+		    (pos + i >= COMMAND_LINE_SIZE ||
+		     !boot_command_line[pos + i] ||
+		     boot_command_line[pos + i] == ' '))
+			return true;
+
+		while (pos < COMMAND_LINE_SIZE && boot_command_line[pos] &&
+		       boot_command_line[pos] != ' ')
+			pos++;
+	}
+
+	return false;
+}
+
+static bool faasev_vmpl_active_early(void)
+{
+	return faasev_vmpl_boot || faasev_vmpl_requested_on_cmdline();
 }
 
 static int vc_fetch_insn_kernel(struct es_em_ctxt *ctxt,
@@ -872,16 +928,33 @@ out_restore_irq:
 static void pvalidate_pages(unsigned long vaddr, unsigned int npages, bool validate)
 {
 	unsigned long vaddr_end;
+	bool first = true;
 	int rc;
 
 	vaddr = vaddr & PAGE_MASK;
 	vaddr_end = vaddr + (npages << PAGE_SHIFT);
 
+	faasev_early_ghcb_debug(0xb8);
 	while (vaddr < vaddr_end) {
+		if (first)
+			faasev_early_ghcb_debug(0xb9);
+
 		rc = pvalidate(vaddr, RMP_PG_SIZE_4K, validate);
+		if (first)
+			faasev_early_ghcb_debug(0xba);
+
+		if (rc)
+			faasev_early_ghcb_debug(0xbb);
+
 		WARN(rc, "Failed to validate address 0x%lx ret %d", vaddr, rc);
 		vaddr = vaddr + PAGE_SIZE;
+
+		if (first) {
+			faasev_early_ghcb_debug(0xbc);
+			first = false;
+		}
 	}
+	faasev_early_ghcb_debug(0xbd);
 }
 
 static void __init early_set_pages_state(unsigned long paddr, unsigned int npages, enum psc_op op)
@@ -925,6 +998,8 @@ e_term:
 void __init early_snp_set_memory_private(unsigned long vaddr, unsigned long paddr,
 					 unsigned int npages)
 {
+	faasev_early_ghcb_debug(0xa0);
+
 	/*
 	 * This can be invoked in early boot while running identity mapped, so
 	 * use an open coded check for SNP instead of using cc_platform_has().
@@ -933,6 +1008,21 @@ void __init early_snp_set_memory_private(unsigned long vaddr, unsigned long padd
 	 */
 	if (!(sev_status & MSR_AMD64_SEV_SNP_ENABLED))
 		return;
+
+	faasev_early_ghcb_debug(0xa1);
+
+	/*
+	 * In the VMPL template path the snapshot recorder has already accepted
+	 * the private mailbox and granted VMPL1 access with RMPADJUST. Sending a
+	 * fresh host PSC private request for the mailbox would RMPUPDATE the
+	 * entry and clear those lower-VMPL permissions, causing VMPL1 RMP faults
+	 * when it later writes the snapshot context.
+	 */
+	if (faasev_vmpl_active_early() &&
+	    sev_snapshot_range_is_mailbox_pa(paddr, npages)) {
+		faasev_early_ghcb_debug(0x5c);
+		return;
+	}
 
 	 /*
 	  * Ask the hypervisor to mark the memory pages as private in the RMP
@@ -940,13 +1030,22 @@ void __init early_snp_set_memory_private(unsigned long vaddr, unsigned long padd
 	  */
 	early_set_pages_state(paddr, npages, SNP_PAGE_STATE_PRIVATE);
 
+	faasev_early_ghcb_debug(0xa2);
+
 	/* Validate the memory pages after they've been added in the RMP table. */
-	pvalidate_pages(vaddr, npages, true);
+	if (faasev_vmpl_boot)
+		faasev_early_ghcb_debug(0x5b);
+	else
+		pvalidate_pages(vaddr, npages, true);
+
+	faasev_early_ghcb_debug(0xa3);
 }
 
 void __init early_snp_set_memory_shared(unsigned long vaddr, unsigned long paddr,
 					unsigned int npages)
 {
+	faasev_early_ghcb_debug(0xa4);
+
 	/*
 	 * This can be invoked in early boot while running identity mapped, so
 	 * use an open coded check for SNP instead of using cc_platform_has().
@@ -956,12 +1055,24 @@ void __init early_snp_set_memory_shared(unsigned long vaddr, unsigned long paddr
 	if (!(sev_status & MSR_AMD64_SEV_SNP_ENABLED))
 		return;
 
+	faasev_early_ghcb_debug(0xa5);
 
-	/* Invalidate the memory pages before they are marked shared in the RMP table. */
-	pvalidate_pages(vaddr, npages, false);
+	/*
+	 * A lower-VMPL Linux guest cannot safely perform the devalidate step
+	 * itself during early boot. The VMPL template path lets the host/VMPL0
+	 * PSC handler own the RMP transition instead.
+	 */
+	if (faasev_vmpl_boot)
+		faasev_early_ghcb_debug(0x5a);
+	else
+		pvalidate_pages(vaddr, npages, false);
+
+	faasev_early_ghcb_debug(0xa6);
 
 	 /* Ask hypervisor to mark the memory pages shared in the RMP table. */
 	early_set_pages_state(paddr, npages, SNP_PAGE_STATE_SHARED);
+
+	faasev_early_ghcb_debug(0xa7);
 }
 
 void __init snp_prep_memory(unsigned long paddr, unsigned int sz, enum psc_op op)
@@ -1134,7 +1245,8 @@ void snp_set_memory_shared(unsigned long vaddr, unsigned int npages)
 	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
 		return;
 
-	pvalidate_pages(vaddr, npages, false);
+	if (!faasev_vmpl_boot)
+		pvalidate_pages(vaddr, npages, false);
 
 	set_pages_state(vaddr, npages, SNP_PAGE_STATE_SHARED);
 }
@@ -1144,9 +1256,14 @@ void snp_set_memory_private(unsigned long vaddr, unsigned int npages)
 	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
 		return;
 
+	if (faasev_vmpl_boot &&
+	    sev_snapshot_range_is_mailbox_pa(__pa(vaddr), npages))
+		return;
+
 	set_pages_state(vaddr, npages, SNP_PAGE_STATE_PRIVATE);
 
-	pvalidate_pages(vaddr, npages, true);
+	if (!faasev_vmpl_boot)
+		pvalidate_pages(vaddr, npages, true);
 }
 
 static int snp_set_vmsa(void *va, bool vmsa)

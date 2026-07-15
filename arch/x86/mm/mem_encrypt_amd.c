@@ -50,13 +50,46 @@ EXPORT_SYMBOL(sme_me_mask);
 /* Buffer used for early in-place encryption by BSP, no locking needed */
 static char sme_early_buffer[PAGE_SIZE] __initdata __aligned(PAGE_SIZE);
 
+static bool __init faasev_vmpl_boot(void)
+{
+	const char option[] = "faasev_vmpl=1";
+	size_t pos = 0;
+
+	while (pos < COMMAND_LINE_SIZE && boot_command_line[pos]) {
+		size_t i = 0;
+
+		while (pos < COMMAND_LINE_SIZE && boot_command_line[pos] == ' ')
+			pos++;
+		if (pos >= COMMAND_LINE_SIZE || !boot_command_line[pos])
+			break;
+
+		while (i < sizeof(option) - 1 &&
+		       pos + i < COMMAND_LINE_SIZE &&
+		       boot_command_line[pos + i] == option[i])
+			i++;
+
+		if (i == sizeof(option) - 1 &&
+		    (pos + i >= COMMAND_LINE_SIZE ||
+		     !boot_command_line[pos + i] ||
+		     boot_command_line[pos + i] == ' '))
+			return true;
+
+		while (pos < COMMAND_LINE_SIZE && boot_command_line[pos] &&
+		       boot_command_line[pos] != ' ')
+			pos++;
+	}
+
+	return false;
+}
+
 /*
  * SNP-specific routine which needs to additionally change the page state from
  * private to shared before copying the data from the source to destination and
  * restore after the copy.
  */
 static inline void __init snp_memcpy(void *dst, void *src, size_t sz,
-				     unsigned long paddr, bool decrypt)
+				     unsigned long paddr, bool decrypt,
+				     bool restore_private)
 {
 	unsigned long npages = PAGE_ALIGN(sz) >> PAGE_SHIFT;
 
@@ -70,7 +103,9 @@ static inline void __init snp_memcpy(void *dst, void *src, size_t sz,
 		memcpy(dst, src, sz);
 
 		/* Restore the page state after the memcpy. */
-		early_snp_set_memory_private((unsigned long)__va(paddr), paddr, npages);
+		if (restore_private)
+			early_snp_set_memory_private((unsigned long)__va(paddr),
+						     paddr, npages);
 	} else {
 		/*
 		 * @paddr need to be accessed encrypted, no need for the page state
@@ -129,8 +164,12 @@ static void __init __sme_early_enc_dec(resource_size_t paddr,
 		 * avoid data corruption as documented in the APM.
 		 */
 		if (cc_platform_has(CC_ATTR_GUEST_SEV_SNP)) {
-			snp_memcpy(sme_early_buffer, src, len, paddr, enc);
-			snp_memcpy(dst, sme_early_buffer, len, paddr, !enc);
+			bool vmpl_boot = faasev_vmpl_boot();
+
+			snp_memcpy(sme_early_buffer, src, len, paddr, enc,
+				   enc || !vmpl_boot);
+			snp_memcpy(dst, sme_early_buffer, len, paddr, !enc,
+				   !vmpl_boot);
 		} else {
 			memcpy(sme_early_buffer, src, len);
 			memcpy(dst, sme_early_buffer, len);
@@ -511,6 +550,15 @@ void __init mem_encrypt_free_decrypted_mem(void)
 	vaddr = (unsigned long)__start_bss_decrypted_unused;
 	vaddr_end = (unsigned long)__end_bss_decrypted;
 	npages = (vaddr_end - vaddr) >> PAGE_SHIFT;
+
+	/*
+	 * Lower-VMPL Linux cannot execute the PVALIDATE step required after a
+	 * shared->private PSC transition.  Keep the small unused decrypted tail
+	 * reserved for now instead of converting it back to private and faulting
+	 * on the first free_init_pages() poison write.
+	 */
+	if (faasev_vmpl_boot())
+		return;
 
 	/*
 	 * If the unused memory range was mapped decrypted, change the encryption

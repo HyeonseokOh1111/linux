@@ -182,6 +182,33 @@ static __always_inline struct sev_snapshot_mailbox *sev_snapshot_mailbox_va(void
 	return __va(sev_snapshot_mailbox_pa);
 }
 
+bool sev_snapshot_range_is_mailbox_pa(unsigned long paddr, unsigned int npages)
+{
+	u64 start, end, mailbox_start, mailbox_len, mailbox_end, size;
+
+	if (!npages)
+		return false;
+
+	start = paddr & PAGE_MASK;
+	size = (u64)npages << PAGE_SHIFT;
+	end = start + size;
+	if (end < start)
+		return false;
+
+	mailbox_start = sev_snapshot_mailbox_pa;
+	mailbox_len = sev_snapshot_mailbox_len;
+	if (!mailbox_start || !mailbox_len) {
+		mailbox_start = SEV_SNAPSHOT_FIXED_MAILBOX_PA;
+		mailbox_len = SEV_SNAPSHOT_MAILBOX_SIZE;
+	}
+
+	mailbox_end = mailbox_start + mailbox_len;
+	if (mailbox_end < mailbox_start)
+		return false;
+
+	return start >= mailbox_start && end <= mailbox_end;
+}
+
 static __always_inline struct sev_snapshot_mailbox *sev_snapshot_restore_mailbox_va(void)
 {
 	return __va(SEV_SNAPSHOT_FIXED_MAILBOX_PA);
@@ -710,6 +737,37 @@ static void sev_snapshot_flush_shared_extents_v2(
 		sev_snapshot_mailbox_v2_shared_extent_count(mailbox),
 		sev_snapshot_mailbox_v2_shared_extents(mailbox),
 		shared_extents_offset);
+}
+
+static size_t sev_snapshot_mailbox_v2_written_len(
+	struct sev_snapshot_mailbox_v2 *mailbox)
+{
+	size_t mailbox_len = sev_snapshot_mailbox_len;
+	size_t shared_extents_offset;
+	size_t shared_extents_len;
+	u32 shared_extent_count;
+
+	if (!mailbox)
+		return 0;
+
+	if (!mailbox_len)
+		mailbox_len = SEV_SNAPSHOT_MAILBOX_SIZE;
+
+	shared_extents_offset = READ_ONCE(mailbox->header.cpu_bundle_len) +
+				2 * sizeof(u32);
+	if (shared_extents_offset > mailbox_len)
+		return mailbox_len;
+
+	shared_extent_count =
+		READ_ONCE(*sev_snapshot_mailbox_v2_shared_extent_count(mailbox));
+	shared_extent_count = min_t(u32, shared_extent_count,
+				    SEV_SNAPSHOT_SHARED_EXTENT_MAX);
+	shared_extents_len = (size_t)shared_extent_count *
+			     sizeof(struct sev_snapshot_shared_extent);
+	if (shared_extents_len > mailbox_len - shared_extents_offset)
+		shared_extents_len = mailbox_len - shared_extents_offset;
+
+	return shared_extents_offset + shared_extents_len;
 }
 
 static void sev_snapshot_shared_init(void)
@@ -1358,6 +1416,7 @@ static long sev_snapshot_capture_final(const struct pt_regs *regs)
 	if (cpu)
 		return -EINVAL;
 
+	sev_snapshot_restore_debug_code(0x73);
 	cpu_count = sev_snapshot_restore_cpu_count();
 	if (!sev_snapshot_v2_online_cpus_match(cpu_count) ||
 	    (sev_snapshot_multi_vcpu_restore_enabled() &&
@@ -1366,9 +1425,11 @@ static long sev_snapshot_capture_final(const struct pt_regs *regs)
 
 	mailbox_v2 = (struct sev_snapshot_mailbox_v2 *)mailbox;
 	sev_snapshot_init_mailbox_v2(mailbox_v2, cpu_count);
+	sev_snapshot_restore_debug_code(0x74);
 	ret = sev_snapshot_freeze_virtio_devices();
 	if (ret)
 		return ret;
+	sev_snapshot_restore_debug_code(0x75);
 	if (cpu_count > SEV_SNAPSHOT_V2_MIN_CPUS) {
 		ret = sev_snapshot_rendezvous_secondary_cpu_v2(mailbox_v2,
 							       cpu_count);
@@ -1380,14 +1441,20 @@ static long sev_snapshot_capture_final(const struct pt_regs *regs)
 	sev_snapshot_fill_context(
 		sev_snapshot_mailbox_v2_cpu_context(mailbox_v2, cpu_count, 0),
 		regs, true);
+	sev_snapshot_restore_debug_code(0x76);
 	sev_snapshot_suspend_local_tick();
+	sev_snapshot_restore_debug_code(0x77);
 	sev_snapshot_rebuild_shared_extents_from_direct_map();
+	sev_snapshot_restore_debug_code(0x78);
 	sev_snapshot_flush_shared_extents_v2(mailbox_v2);
-	clflush_cache_range(mailbox_v2, SEV_SNAPSHOT_MAILBOX_SIZE);
+	clflush_cache_range(mailbox_v2,
+			    sev_snapshot_mailbox_v2_written_len(mailbox_v2));
 	wmb();
+	sev_snapshot_restore_debug_code(0x79);
 	ret = sev_snapshot_signal_host_capture();
 	if (ret)
 		return ret;
+	sev_snapshot_restore_debug_code(0x7a);
 
 	sev_snapshot_spin_after_capture();
 }

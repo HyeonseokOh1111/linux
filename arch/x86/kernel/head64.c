@@ -39,8 +39,27 @@
 #include <asm/realmode.h>
 #include <asm/extable.h>
 #include <asm/trapnr.h>
+#include <asm/msr-index.h>
 #include <asm/sev.h>
 #include <asm/tdx.h>
+
+#define FAASEV_GHCB_DEBUG(code)						\
+	asm volatile("pushfq\n\t"						\
+		     "pushq %%rax\n\t"						\
+		     "pushq %%rcx\n\t"						\
+		     "pushq %%rdx\n\t"						\
+		     "movl %0, %%ecx\n\t"					\
+		     "movl $0x14, %%eax\n\t"					\
+		     "movl %1, %%edx\n\t"					\
+		     "wrmsr\n\t"						\
+		     "rep; vmmcall\n\t"						\
+		     "popq %%rdx\n\t"						\
+		     "popq %%rcx\n\t"						\
+		     "popq %%rax\n\t"						\
+		     "popfq\n\t"						\
+		     :								\
+		     : "i"(MSR_AMD64_SEV_ES_GHCB), "i"((code) << 16)	\
+		     : "memory")
 
 /*
  * Manage page tables very early on.
@@ -86,6 +105,44 @@ static struct desc_ptr startup_gdt_descr = {
 
 #define __head	__section(".head.text")
 
+static bool __head faasev_vmpl_boot(struct boot_params *bp)
+{
+	unsigned long cmdline_ptr = bp->hdr.cmd_line_ptr;
+	const char option[] = "faasev_vmpl=1";
+	const char *cmdline;
+	int pos = 0;
+
+	cmdline_ptr |= (u64)bp->ext_cmd_line_ptr << 32;
+	if (!cmdline_ptr)
+		return false;
+
+	cmdline = (const char *)cmdline_ptr;
+	while (pos < COMMAND_LINE_SIZE && cmdline[pos]) {
+		int i = 0;
+
+		while (pos < COMMAND_LINE_SIZE && cmdline[pos] == ' ')
+			pos++;
+		if (pos >= COMMAND_LINE_SIZE || !cmdline[pos])
+			break;
+
+		while (option[i] &&
+		       pos + i < COMMAND_LINE_SIZE &&
+		       cmdline[pos + i] == option[i])
+			i++;
+
+		if (!option[i] &&
+		    (pos + i >= COMMAND_LINE_SIZE ||
+		     !cmdline[pos + i] ||
+		     cmdline[pos + i] == ' '))
+			return true;
+
+		while (pos < COMMAND_LINE_SIZE && cmdline[pos] && cmdline[pos] != ' ')
+			pos++;
+	}
+
+	return false;
+}
+
 static void __head *fixup_pointer(void *ptr, unsigned long physaddr)
 {
 	return ptr - (void *)_text + (void *)physaddr;
@@ -130,10 +187,15 @@ static bool __head check_la57_support(unsigned long physaddr)
 static unsigned long __head sme_postprocess_startup(struct boot_params *bp, pmdval_t *pmd)
 {
 	unsigned long vaddr, vaddr_end;
+	bool faasev_vmpl = faasev_vmpl_boot(bp);
 	int i;
+
+	FAASEV_GHCB_DEBUG(0xf0);
 
 	/* Encrypt the kernel and related (if SME is active) */
 	sme_encrypt_kernel(bp);
+
+	FAASEV_GHCB_DEBUG(0xf1);
 
 	/*
 	 * Clear the memory encryption mask from the .bss..decrypted section.
@@ -144,6 +206,8 @@ static unsigned long __head sme_postprocess_startup(struct boot_params *bp, pmdv
 	if (sme_get_me_mask()) {
 		vaddr = (unsigned long)__start_bss_decrypted;
 		vaddr_end = (unsigned long)__end_bss_decrypted;
+
+		FAASEV_GHCB_DEBUG(0xf2);
 
 		for (; vaddr < vaddr_end; vaddr += PMD_SIZE) {
 			/*
@@ -156,12 +220,21 @@ static unsigned long __head sme_postprocess_startup(struct boot_params *bp, pmdv
 			 * address but the kernel is currently running off of the identity
 			 * mapping so use __pa() to get a *currently* valid virtual address.
 			 */
-			early_snp_set_memory_shared(__pa(vaddr), __pa(vaddr), PTRS_PER_PMD);
+			FAASEV_GHCB_DEBUG(0xf3);
+			if (faasev_vmpl) {
+				FAASEV_GHCB_DEBUG(0xf7);
+			} else {
+				early_snp_set_memory_shared(__pa(vaddr), __pa(vaddr), PTRS_PER_PMD);
+				FAASEV_GHCB_DEBUG(0xf4);
+			}
 
 			i = pmd_index(vaddr);
 			pmd[i] -= sme_get_me_mask();
+			FAASEV_GHCB_DEBUG(0xf5);
 		}
 	}
+
+	FAASEV_GHCB_DEBUG(0xf6);
 
 	/*
 	 * Return the SME encryption mask (if SME is active) to be used as a
@@ -190,7 +263,11 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	int i;
 	unsigned int *next_pgt_ptr;
 
+	FAASEV_GHCB_DEBUG(0xe0);
+
 	la57 = check_la57_support(physaddr);
+
+	FAASEV_GHCB_DEBUG(0xe1);
 
 	/* Is the address too large? */
 	if (physaddr >> MAX_PHYSMEM_BITS)
@@ -205,6 +282,8 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	/* Is the address not 2M aligned? */
 	if (load_delta & ~PMD_MASK)
 		for (;;);
+
+	FAASEV_GHCB_DEBUG(0xe2);
 
 	/* Include the SME encryption mask in the fixup value */
 	load_delta += sme_get_me_mask();
@@ -231,6 +310,8 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	pmd = fixup_pointer(level2_fixmap_pgt, physaddr);
 	for (i = FIXMAP_PMD_TOP; i > FIXMAP_PMD_TOP - FIXMAP_PMD_NUM; i--)
 		pmd[i] += load_delta;
+
+	FAASEV_GHCB_DEBUG(0xe3);
 
 	/*
 	 * Set up the identity mapping for the switchover.  These
@@ -266,6 +347,8 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	pud[(i + 0) % PTRS_PER_PUD] = (pudval_t)pmd + pgtable_flags;
 	pud[(i + 1) % PTRS_PER_PUD] = (pudval_t)pmd + pgtable_flags;
 
+	FAASEV_GHCB_DEBUG(0xe4);
+
 	pmd_entry = __PAGE_KERNEL_LARGE_EXEC & ~_PAGE_GLOBAL;
 	/* Filter out unsupported __PAGE_KERNEL_* bits: */
 	mask_ptr = fixup_pointer(&__supported_pte_mask, physaddr);
@@ -278,6 +361,8 @@ unsigned long __head __startup_64(unsigned long physaddr,
 
 		pmd[idx % PTRS_PER_PMD] = pmd_entry + i * PMD_SIZE;
 	}
+
+	FAASEV_GHCB_DEBUG(0xe5);
 
 	/*
 	 * Fixup the kernel text+data virtual addresses. Note that
@@ -315,6 +400,8 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	 * the true physical address.
 	 */
 	*fixup_long(&phys_base, physaddr) += load_delta - sme_get_me_mask();
+
+	FAASEV_GHCB_DEBUG(0xe6);
 
 	return sme_postprocess_startup(bp, pmd);
 }
@@ -473,6 +560,8 @@ static void __init copy_bootdata(char *real_mode_data)
 
 asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode_data)
 {
+	FAASEV_GHCB_DEBUG(0xe8);
+
 	/*
 	 * Build-time sanity checks on the kernel image and module
 	 * area mappings. (these are purely build-time and produce no code)
@@ -488,17 +577,21 @@ asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode
 	BUILD_BUG_ON(__fix_to_virt(__end_of_fixed_addresses) <= MODULES_END);
 
 	cr4_init_shadow();
+	FAASEV_GHCB_DEBUG(0xe9);
 
 	/* Kill off the identity-map trampoline */
 	reset_early_page_tables();
+	FAASEV_GHCB_DEBUG(0xea);
 
 	clear_bss();
+	FAASEV_GHCB_DEBUG(0xeb);
 
 	/*
 	 * This needs to happen *before* kasan_early_init() because latter maps stuff
 	 * into that page.
 	 */
 	clear_page(init_top_pgt);
+	FAASEV_GHCB_DEBUG(0xec);
 
 	/*
 	 * SME support may update early_pmd_flags to include the memory
@@ -506,8 +599,10 @@ asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode
 	 * that may generate a page fault.
 	 */
 	sme_early_init();
+	FAASEV_GHCB_DEBUG(0xed);
 
 	kasan_early_init();
+	FAASEV_GHCB_DEBUG(0xee);
 
 	/*
 	 * Flush global TLB entries which could be left over from the trampoline page
@@ -518,32 +613,42 @@ asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode
 	 * instrumentation to work.
 	 */
 	__native_tlb_flush_global(this_cpu_read(cpu_tlbstate.cr4));
+	FAASEV_GHCB_DEBUG(0xef);
 
 	idt_setup_early_handler();
+	FAASEV_GHCB_DEBUG(0x80);
 
 	/* Needed before cc_platform_has() can be used for TDX */
 	tdx_early_init();
+	FAASEV_GHCB_DEBUG(0x81);
 
 	copy_bootdata(__va(real_mode_data));
+	FAASEV_GHCB_DEBUG(0x82);
 
 	/*
 	 * Load microcode early on BSP.
 	 */
 	load_ucode_bsp();
+	FAASEV_GHCB_DEBUG(0x83);
 
 	/* set init_top_pgt kernel high mapping*/
 	init_top_pgt[511] = early_top_pgt[511];
+	FAASEV_GHCB_DEBUG(0x84);
 
 	x86_64_start_reservations(real_mode_data);
 }
 
 void __init __noreturn x86_64_start_reservations(char *real_mode_data)
 {
+	FAASEV_GHCB_DEBUG(0x85);
+
 	/* version is always not zero if it is copied */
 	if (!boot_params.hdr.version)
 		copy_bootdata(__va(real_mode_data));
+	FAASEV_GHCB_DEBUG(0x86);
 
 	x86_early_init_platform_quirks();
+	FAASEV_GHCB_DEBUG(0x87);
 
 	switch (boot_params.hdr.hardware_subarch) {
 	case X86_SUBARCH_INTEL_MID:
@@ -553,6 +658,7 @@ void __init __noreturn x86_64_start_reservations(char *real_mode_data)
 		break;
 	}
 
+	FAASEV_GHCB_DEBUG(0x88);
 	start_kernel();
 }
 

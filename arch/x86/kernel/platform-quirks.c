@@ -1,12 +1,48 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/string.h>
 
 #include <asm/setup.h>
 #include <asm/bios_ebda.h>
+#include <asm/x86_init.h>
+
+static bool __init faasev_vmpl_boot(void)
+{
+	const char option[] = "faasev_vmpl=1";
+	size_t pos = 0;
+
+	while (pos < COMMAND_LINE_SIZE && boot_command_line[pos]) {
+		size_t i = 0;
+
+		while (pos < COMMAND_LINE_SIZE && boot_command_line[pos] == ' ')
+			pos++;
+		if (pos >= COMMAND_LINE_SIZE || !boot_command_line[pos])
+			break;
+
+		while (i < sizeof(option) - 1 &&
+		       pos + i < COMMAND_LINE_SIZE &&
+		       boot_command_line[pos + i] == option[i])
+			i++;
+
+		if (i == sizeof(option) - 1 &&
+		    (pos + i >= COMMAND_LINE_SIZE ||
+		     !boot_command_line[pos + i] ||
+		     boot_command_line[pos + i] == ' '))
+			return true;
+
+		while (pos < COMMAND_LINE_SIZE && boot_command_line[pos] &&
+		       boot_command_line[pos] != ' ')
+			pos++;
+	}
+
+	return false;
+}
 
 void __init x86_early_init_platform_quirks(void)
 {
+	bool vmpl_boot = faasev_vmpl_boot();
+
 	x86_platform.legacy.i8042 = X86_LEGACY_I8042_EXPECTED_PRESENT;
 	x86_platform.legacy.rtc = 1;
 	x86_platform.legacy.warm_reset = 1;
@@ -31,6 +67,19 @@ void __init x86_early_init_platform_quirks(void)
 
 	if (x86_platform.set_legacy_features)
 		x86_platform.set_legacy_features();
+
+	/*
+	 * A VMPL1 Linux entry does not run with conventional PC firmware state.
+	 * The template recorder has already prepared the low-memory boot data,
+	 * and probing BIOS/EBDA words through direct-map low-memory aliases can
+	 * fault before normal exception handling is available.
+	 */
+	if (vmpl_boot) {
+		x86_init.resources.probe_roms = x86_init_noop;
+		x86_init.mpparse.find_smp_config = x86_init_noop;
+		x86_init.mpparse.get_smp_config = x86_init_uint_noop;
+		x86_platform.legacy.reserve_bios_regions = 0;
+	}
 }
 
 bool __init x86_pnpbios_disabled(void)
