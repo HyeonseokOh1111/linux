@@ -1223,7 +1223,7 @@ static void sev_snapshot_init_mailbox_v2(struct sev_snapshot_mailbox_v2 *mailbox
 static void sev_snapshot_init_mailbox_v2_vmsa_only(
 	struct sev_snapshot_mailbox_v2 *mailbox, u32 cpu_count)
 {
-	size_t bundle_len = sev_snapshot_mailbox_v2_cpu_context_offset(cpu_count);
+	size_t bundle_len = ALIGN(sizeof(struct sev_snapshot_mailbox_v2_header), 8);
 
 	memset(mailbox, 0, bundle_len + 2 * sizeof(u32));
 	mailbox->header.magic = SEV_SNAPSHOT_MAILBOX_V2_MAGIC;
@@ -1548,7 +1548,6 @@ static long sev_snapshot_capture_vmpl_vmsa_primary(void)
 
 	mailbox_v2 = (struct sev_snapshot_mailbox_v2 *)mailbox;
 	sev_snapshot_init_mailbox_v2_vmsa_only(mailbox_v2, cpu_count);
-	sev_snapshot_fill_topology(mailbox_v2, cpu_count, 0, 0);
 
 	sev_snapshot_restore_debug_code(0x73);
 	ret = sev_snapshot_vmpl_freeze_virtio_devices();
