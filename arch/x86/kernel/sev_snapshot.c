@@ -106,6 +106,7 @@ bool sev_snapshot_resume_in_progress;
 static cpumask_t sev_snapshot_saved_cpus_allowed;
 static bool sev_snapshot_saved_cpus_allowed_valid;
 static unsigned int sev_snapshot_restore_mode = SEV_SNAPSHOT_RESTORE_MODE_SINGLE_VCPU;
+static bool sev_snapshot_vmpl_mode;
 static atomic_t sev_snapshot_v2_ap_ready = ATOMIC_INIT(0);
 static atomic_t sev_snapshot_v2_ap_error = ATOMIC_INIT(0);
 static atomic_t sev_snapshot_v2_ap_request_epoch = ATOMIC_INIT(0);
@@ -173,6 +174,18 @@ static int __init sev_snapshot_restore_mode_setup(char *arg)
 	return 0;
 }
 early_param("sev_snapshot_restore_mode", sev_snapshot_restore_mode_setup);
+
+static int __init sev_snapshot_vmpl_mode_setup(char *arg)
+{
+	if (!arg || !strcmp(arg, "1") || !strcmp(arg, "y") ||
+	    !strcmp(arg, "Y") || !strcmp(arg, "true"))
+		sev_snapshot_vmpl_mode = true;
+	else
+		sev_snapshot_vmpl_mode = false;
+
+	return 0;
+}
+early_param("faasev_vmpl", sev_snapshot_vmpl_mode_setup);
 
 static __always_inline struct sev_snapshot_mailbox *sev_snapshot_mailbox_va(void)
 {
@@ -344,6 +357,31 @@ static int sev_snapshot_restore_virtio_devices(void)
 
 	WRITE_ONCE(sev_snapshot_virtio_devices_frozen, false);
 	return 0;
+}
+
+static int sev_snapshot_vmpl_freeze_virtio_devices(void)
+{
+	int ret;
+
+	ret = virtio_sev_snapshot_freeze_devices();
+	if (ret) {
+		virtio_sev_snapshot_restore_devices();
+		return ret;
+	}
+
+	return 0;
+}
+
+static int sev_snapshot_vmpl_restore_virtio_devices(void)
+{
+	int ret;
+
+	local_irq_enable();
+	ret = virtio_sev_snapshot_restore_devices();
+	local_irq_disable();
+	WRITE_ONCE(sev_snapshot_virtio_devices_frozen, false);
+
+	return ret;
 }
 
 static void sev_snapshot_install_sp0_scratch_stack(void)
@@ -1002,6 +1040,20 @@ static int sev_snapshot_signal_host_capture(void)
 	return 0;
 }
 
+static int sev_snapshot_signal_host_capture_canonical_irqoff(void)
+{
+	u64 ghcb_msr;
+
+	local_irq_disable();
+	ghcb_msr = __rdmsr(MSR_AMD64_SEV_ES_GHCB);
+	native_wrmsrl(MSR_AMD64_SEV_ES_GHCB,
+		      SEV_SNAPSHOT_REQUEST_HOST_EVENT_SIGNAL);
+	VMGEXIT();
+	native_wrmsrl(MSR_AMD64_SEV_ES_GHCB, ghcb_msr);
+
+	return 0;
+}
+
 static int sev_snapshot_prepare_capture(void)
 {
 	struct sev_snapshot_mailbox *mailbox;
@@ -1166,6 +1218,22 @@ static void sev_snapshot_init_mailbox_v2(struct sev_snapshot_mailbox_v2 *mailbox
 	mailbox->header.mode = sev_snapshot_restore_mode;
 	mailbox->header.cpu_count = cpu_count;
 	mailbox->header.cpu_bundle_len = bundle_len;
+}
+
+static void sev_snapshot_init_mailbox_v2_vmsa_only(
+	struct sev_snapshot_mailbox_v2 *mailbox, u32 cpu_count)
+{
+	size_t bundle_len = sev_snapshot_mailbox_v2_cpu_context_offset(cpu_count);
+
+	memset(mailbox, 0, bundle_len + 2 * sizeof(u32));
+	mailbox->header.magic = SEV_SNAPSHOT_MAILBOX_V2_MAGIC;
+	mailbox->header.version = SEV_SNAPSHOT_MAILBOX_V2_VERSION;
+	mailbox->header.header_size =
+		sizeof(struct sev_snapshot_mailbox_v2_header);
+	mailbox->header.mode = SEV_SNAPSHOT_RESTORE_MODE_SINGLE_VCPU;
+	mailbox->header.cpu_count = cpu_count;
+	mailbox->header.cpu_bundle_len = bundle_len;
+	mailbox->header.flags = SEV_SNAPSHOT_MAILBOX_V2_F_VMPL_VMSA_ONLY;
 }
 
 static __always_inline void
@@ -1459,6 +1527,88 @@ static long sev_snapshot_capture_final(const struct pt_regs *regs)
 	sev_snapshot_spin_after_capture();
 }
 
+static long sev_snapshot_capture_vmpl_vmsa_primary(void)
+{
+	struct sev_snapshot_mailbox *mailbox;
+	struct sev_snapshot_mailbox_v2 *mailbox_v2;
+	u32 cpu_count;
+	long ret;
+
+	mailbox = sev_snapshot_mailbox_va();
+	if (!mailbox)
+		return -ENODEV;
+
+	if (raw_smp_processor_id())
+		return -EINVAL;
+
+	cpu_count = sev_snapshot_restore_cpu_count();
+	if (cpu_count != SEV_SNAPSHOT_V2_MIN_CPUS ||
+	    !sev_snapshot_v2_online_cpus_match(cpu_count))
+		return -EINVAL;
+
+	mailbox_v2 = (struct sev_snapshot_mailbox_v2 *)mailbox;
+	sev_snapshot_init_mailbox_v2_vmsa_only(mailbox_v2, cpu_count);
+	sev_snapshot_fill_topology(mailbox_v2, cpu_count, 0, 0);
+
+	sev_snapshot_restore_debug_code(0x73);
+	ret = sev_snapshot_vmpl_freeze_virtio_devices();
+	if (ret)
+		return ret;
+	sev_snapshot_restore_debug_code(0x75);
+
+	preempt_disable();
+	local_irq_disable();
+
+	sev_snapshot_suspend_local_tick();
+	sev_snapshot_restore_debug_code(0x77);
+	sev_snapshot_rebuild_shared_extents_from_direct_map();
+	sev_snapshot_restore_debug_code(0x78);
+	sev_snapshot_flush_shared_extents_v2(mailbox_v2);
+	clflush_cache_range(mailbox_v2,
+			    sev_snapshot_mailbox_v2_written_len(mailbox_v2));
+	wmb();
+	sev_snapshot_restore_debug_code(0x79);
+
+	ret = sev_snapshot_signal_host_capture_canonical_irqoff();
+	if (ret)
+		goto out_restore_irqoff;
+
+	/*
+	 * In the VMSA-primary VMPL path, restore resumes at the instruction
+	 * following the checkpoint VMGEXIT.  Run only the fixed Linux-side
+	 * post-restore fixups here; do not deserialize pt_regs or other Linux
+	 * continuation state from a checkpoint descriptor.
+	 */
+	sev_snapshot_register_runtime_ghcb_cpu(0);
+	if (!sev_snapshot_negotiate_runtime_ghcb_protocol()) {
+		ret = -EIO;
+		goto out_restore_irqoff;
+	}
+	sev_snapshot_restore_debug_code(0xaa);
+	kvm_sev_snapshot_restore_reinit();
+	sev_snapshot_restore_debug_code(0xab);
+	sev_snapshot_drain_local_apic_isr();
+	sev_snapshot_clear_idle_polling_flags();
+	sev_snapshot_restore_debug_code(0xb0);
+	sev_snapshot_resume_local_tick();
+	sev_snapshot_rearm_boot_local_apic_timer();
+	ret = sev_snapshot_vmpl_restore_virtio_devices();
+	if (ret)
+		goto out_restore_irqoff;
+	sev_snapshot_restore_debug_code(0xef);
+
+	local_irq_enable();
+	preempt_enable();
+	sev_snapshot_restore_current_affinity();
+	return 0;
+
+out_restore_irqoff:
+	local_irq_enable();
+	preempt_enable();
+	sev_snapshot_abort_capture_setup();
+	return ret;
+}
+
 long sev_snapshot_arm(void)
 {
 	u32 cpu_count;
@@ -1494,6 +1644,10 @@ long sev_snapshot_arm(void)
 		sev_snapshot_abort_capture_setup();
 		return ret;
 	}
+
+	if (sev_snapshot_vmpl_mode &&
+	    !sev_snapshot_multi_vcpu_restore_enabled())
+		return sev_snapshot_capture_vmpl_vmsa_primary();
 
 	this_cpu_write(sev_snapshot_pending_task, current);
 	return 0;
