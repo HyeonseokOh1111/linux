@@ -131,6 +131,8 @@ static_assert(sizeof(struct sev_snapshot_cpu_context) == 0x11f8);
 extern void sev_snapshot_restore_entry_early(struct sev_snapshot_mailbox *mailbox);
 extern void sev_snapshot_restore_from_mailbox(struct sev_snapshot_mailbox *mailbox,
 					      u64 restore_cpu_id);
+extern void sev_snapshot_restore_from_desc(struct sev_snapshot_cpu_context *ctx,
+					   u64 restore_cpu_id);
 extern void sev_snapshot_resume_from_ptregs(struct pt_regs *regs);
 extern void sev_snapshot_resume_kernel_thread_from_ptregs(
 	const struct pt_regs *regs);

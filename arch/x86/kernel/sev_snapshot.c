@@ -1701,6 +1701,18 @@ static bool sev_snapshot_mailbox_is_v2(struct sev_snapshot_mailbox *mailbox)
 		       SEV_SNAPSHOT_MAILBOX_V2_VERSION;
 }
 
+static bool sev_snapshot_restore_arg_is_direct_context(
+	struct sev_snapshot_mailbox *mailbox)
+{
+	struct sev_snapshot_cpu_context *ctx =
+		(struct sev_snapshot_cpu_context *)mailbox;
+
+	if (!mailbox)
+		return false;
+
+	return READ_ONCE(ctx->context_size) == sizeof(*ctx);
+}
+
 static struct sev_snapshot_cpu_context *sev_snapshot_select_restore_context(
 	struct sev_snapshot_mailbox *mailbox,
 	u64 restore_cpu_id)
@@ -1906,12 +1918,22 @@ void __noreturn sev_snapshot_restore_from_mailbox(
 	struct desc_ptr restore_gdt_desc;
 	struct pt_regs *regs;
 	u32 restore_cpu_count = 1;
+	bool restore_mailbox_v2 = false;
+	bool restore_trace_phases = false;
 	volatile u16 restore_ds, restore_es, restore_fs, restore_gs, restore_tss;
 
-	ctx = sev_snapshot_select_restore_context(mailbox, restore_cpu_id);
-	if (sev_snapshot_mailbox_is_v2(mailbox)) {
+	if (sev_snapshot_restore_arg_is_direct_context(mailbox)) {
+		if (restore_cpu_id != 0)
+			sev_snapshot_restore_fault();
+		ctx = (struct sev_snapshot_cpu_context *)mailbox;
+		restore_trace_phases = true;
+	} else {
+		ctx = sev_snapshot_select_restore_context(mailbox, restore_cpu_id);
 		mailbox_v2 = (struct sev_snapshot_mailbox_v2 *)mailbox;
-		restore_cpu_count = READ_ONCE(mailbox_v2->header.cpu_count);
+		restore_mailbox_v2 = sev_snapshot_mailbox_is_v2(mailbox);
+		restore_trace_phases = restore_mailbox_v2;
+		if (restore_mailbox_v2)
+			restore_cpu_count = READ_ONCE(mailbox_v2->header.cpu_count);
 	}
 	sev_snapshot_restore_cpu_debug_code(0xd0, restore_cpu_id);
 	restore_ds = READ_ONCE(ctx->ds);
@@ -1965,32 +1987,32 @@ void __noreturn sev_snapshot_restore_from_mailbox(
 	sev_snapshot_restore_cpu_debug_code(0xcd, restore_cpu_id);
 
 	sev_snapshot_restore_xsave_state(mailbox, ctx, restore_cpu_id);
-	if (sev_snapshot_mailbox_is_v2(mailbox))
+	if (restore_trace_phases)
 		sev_snapshot_restore_cpu_debug_code(0xce, restore_cpu_id);
 
 	sev_snapshot_install_sp0_scratch_stack();
-	if (sev_snapshot_mailbox_is_v2(mailbox))
+	if (restore_trace_phases)
 		sev_snapshot_restore_cpu_debug_code(0xa8, restore_cpu_id);
 
 	if (restore_cpu_id == 0) {
-		if (sev_snapshot_mailbox_is_v2(mailbox))
+		if (restore_trace_phases)
 			sev_snapshot_restore_debug_code(0xaa);
 		kvm_sev_snapshot_restore_reinit();
-		if (sev_snapshot_mailbox_is_v2(mailbox))
+		if (restore_trace_phases)
 			sev_snapshot_restore_debug_code(0xab);
 	}
 	if (restore_cpu_id == 0) {
 		sev_snapshot_drain_local_apic_isr();
 		sev_snapshot_clear_idle_polling_flags();
-		if (sev_snapshot_mailbox_is_v2(mailbox))
+		if (restore_trace_phases)
 			sev_snapshot_restore_debug_code(0xb0);
-		if (!sev_snapshot_mailbox_is_v2(mailbox) ||
+		if (!restore_mailbox_v2 ||
 		    restore_cpu_count == SEV_SNAPSHOT_V2_MIN_CPUS) {
 			sev_snapshot_resume_local_tick();
 			sev_snapshot_rearm_boot_local_apic_timer();
 		}
 	}
-	if (sev_snapshot_mailbox_is_v2(mailbox) &&
+	if (restore_mailbox_v2 &&
 	    restore_cpu_count > SEV_SNAPSHOT_V2_MIN_CPUS) {
 		if (restore_cpu_id == 0)
 			sev_snapshot_restore_v2_bsp_barrier_before_resume(mailbox);
@@ -2001,12 +2023,20 @@ void __noreturn sev_snapshot_restore_from_mailbox(
 		sev_snapshot_restore_fault();
 	}
 
-	if (sev_snapshot_mailbox_is_v2(mailbox))
+	if (restore_trace_phases)
 		sev_snapshot_restore_debug_code(0xef);
 	local_irq_disable();
 	sev_snapshot_leave_irq_stack_restore_window(ctx, restore_cpu_id);
 	sev_snapshot_resume_from_ptregs(regs);
 	unreachable();
+}
+
+void __noreturn sev_snapshot_restore_from_desc(
+	struct sev_snapshot_cpu_context *ctx,
+	u64 restore_cpu_id)
+{
+	sev_snapshot_restore_from_mailbox((struct sev_snapshot_mailbox *)ctx,
+					  restore_cpu_id);
 }
 
 void __init sev_mailbox_reserve_from_setup_data(struct boot_params *bp)
