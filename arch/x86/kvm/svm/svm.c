@@ -3420,6 +3420,7 @@ static int svm_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 	struct vcpu_svm *svm = to_svm(vcpu);
 	struct kvm_run *kvm_run = vcpu->run;
 	u32 exit_code = svm->vmcb->control.exit_code;
+	int r;
 
 	trace_kvm_exit(vcpu, KVM_ISA_SVM);
 
@@ -3457,7 +3458,18 @@ static int svm_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 	if (exit_fastpath != EXIT_FASTPATH_NONE)
 		return 1;
 
-	return svm_invoke_exit_handler(vcpu, exit_code);
+	r = svm_invoke_exit_handler(vcpu, exit_code);
+	if (r < 0 && r != -1) {
+		pr_err("faasev-vmpl: svm_handle_exit ret=%d exit_code=%#x exit_info1=%#llx exit_info2=%#llx ghcb=%#llx current_vmpl=%u vmsa_pa=%#llx mp_state=%d\n",
+		       r, exit_code, svm->vmcb->control.exit_info_1,
+		       svm->vmcb->control.exit_info_2,
+		       svm->vmcb->control.ghcb_gpa,
+		       svm->sev_es.snp_current_vmpl,
+		       (u64)svm->vmcb->control.vmsa_pa,
+		       vcpu->arch.mp_state);
+	}
+
+	return r;
 }
 
 static void reload_tss(struct kvm_vcpu *vcpu)

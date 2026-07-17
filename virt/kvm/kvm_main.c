@@ -995,7 +995,11 @@ static int restrictedmem_get_gfn_range(struct kvm_memory_slot *slot,
 	}
 
 	range->start = slot->base_gfn + start - slot->restrictedmem.index;
-	range->end = slot->base_gfn + end - slot->restrictedmem.index;
+	/*
+	 * restrictedmem notifier ranges are inclusive, but KVM's gfn_range.end
+	 * is exclusive.
+	 */
+	range->end = slot->base_gfn + end - slot->restrictedmem.index + 1;
 	range->slot = slot;
 	range->pte = __pte(0);
 	range->may_block = true;

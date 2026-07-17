@@ -18,6 +18,7 @@
 #include <linux/cpumask.h>
 #include <linux/iommu.h>
 #include <linux/amd-iommu.h>
+#include <linux/sched.h>
 
 #include <asm/sev.h>
 #include <asm/processor.h>
@@ -58,6 +59,8 @@ struct rmpentry {
  */
 #define RMPTABLE_CPU_BOOKKEEPING_SZ	0x4000
 #define RMPENTRY_SHIFT			8
+#define RMPUPDATE_MAX_OVERLAP_RETRIES	10000
+#define RMPUPDATE_RESCHED_INTERVAL	256
 #define rmptable_page_offset(x)	(RMPTABLE_CPU_BOOKKEEPING_SZ +		\
 				 (((unsigned long)x) >> RMPENTRY_SHIFT))
 
@@ -420,7 +423,7 @@ static int rmpupdate(u64 pfn, struct rmp_state *val)
 		}
 	}
 
-	do {
+	for (;;) {
 		/* Binutils version 2.36 supports the RMPUPDATE mnemonic. */
 		asm volatile(".byte 0xF2, 0x0F, 0x01, 0xFE"
 			     : "=a"(ret)
@@ -428,14 +431,33 @@ static int rmpupdate(u64 pfn, struct rmp_state *val)
 			     : "memory", "cc");
 
 		attempts++;
-	} while (ret == RMPUPDATE_FAIL_OVERLAP);
+		if (ret != RMPUPDATE_FAIL_OVERLAP)
+			break;
+
+		if (attempts >= RMPUPDATE_MAX_OVERLAP_RETRIES)
+			break;
+
+		if (!(attempts % RMPUPDATE_RESCHED_INTERVAL))
+			cond_resched();
+		else
+			cpu_relax();
+	}
 
 	if (ret) {
-		pr_err("RMPUPDATE failed after %d attempts, ret: %d, pfn: %llx, npages: %d, level: %d\n",
-		       attempts, ret, pfn, npages, level);
+		if (ret == RMPUPDATE_FAIL_OVERLAP)
+			pr_err("RMPUPDATE overlap retry limit exceeded after %d attempts, pfn: %llx, npages: %d, level: %d, assigned: %d, pagesize: %d, gpa: 0x%llx, asid: %d\n",
+			       attempts, pfn, npages, level, val->assigned,
+			       val->pagesize, val->gpa, val->asid);
+		else
+			pr_err("RMPUPDATE failed after %d attempts, ret: %d, pfn: %llx, npages: %d, level: %d\n",
+			       attempts, ret, pfn, npages, level);
 		sev_dump_rmpentry(pfn);
 		dump_stack();
-		return -EFAULT;
+
+		if (val->assigned)
+			restore_direct_map(pfn, npages);
+
+		return ret == RMPUPDATE_FAIL_OVERLAP ? -EBUSY : -EFAULT;
 	}
 
 	/*

@@ -203,11 +203,13 @@ struct snp_vmsa_update {
 struct vmpl_switch_sa {
 	u32 exit_int_info;
 	u32 exit_int_info_err;
+	u32 int_state;
 	unsigned long cr0;
 	unsigned long cr2;
 	unsigned long cr4;
 	unsigned long cr8;
 	u64 efer;
+	bool valid;
 };
 
 struct vcpu_sev_es_state {
