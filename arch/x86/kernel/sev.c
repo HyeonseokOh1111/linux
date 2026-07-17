@@ -2021,6 +2021,18 @@ static enum es_result vc_handle_invalid(struct ghcb *ghcb, struct es_em_ctxt *ct
 
 	fault_addr = native_read_cr2();
 
+	/*
+	 * In the FaaSEV lower-VMPL restore path, restored private pages are
+	 * installed and PVALIDATE'd by the VMPL0 restorer before VMPL1 resumes.
+	 * VMPL1 cannot safely execute PVALIDATE itself here; doing so can raise
+	 * #GP while handling the #VC.  Retry the faulting instruction and let a
+	 * genuinely missing page fault back out to the host lazy-restore path.
+	 */
+	if (faasev_vmpl_boot) {
+		ctxt->insn.length = 0;
+		return ES_OK;
+	}
+
 	if (user_mode(ctxt->regs))
 		stac();
 	pvalidate_pages(fault_addr, 1, true);

@@ -85,6 +85,8 @@
 #define SEV_SNAPSHOT_ATTESTATION_REQUEST_OFFSET \
 	(SEV_SNAPSHOT_CONTROL_SHARED_SIZE - (2 * PAGE_SIZE))
 #define SEV_SNAPSHOT_REQUEST_HOST_EVENT_SIGNAL	0x0051000000000014ULL
+#define SEV_SNAPSHOT_SHARED_STATE_NOTIFY_VALUE	0xf500000000000014ULL
+#define SEV_SNAPSHOT_SHARED_STATE_NOTIFY_MAX_RUN_PAGES	256UL
 #define SEV_SNAPSHOT_APIC_DIVISOR		16
 #define SEV_SNAPSHOT_FALLBACK_AP_TMICT		0x3d091U
 
@@ -574,6 +576,42 @@ static void sev_snapshot_add_shared_extent_locked(u64 gpa, u64 npages)
 	}
 }
 
+static void sev_snapshot_notify_vmpl0_page_state_pa(u64 gpa, u64 npages,
+						    enum psc_op op)
+{
+	unsigned long flags;
+	u64 ghcb_msr;
+
+	if (!sev_snapshot_vmpl_mode || !npages)
+		return;
+	if (op != SNP_PAGE_STATE_SHARED && op != SNP_PAGE_STATE_PRIVATE)
+		return;
+
+	local_irq_save(flags);
+	ghcb_msr = __rdmsr(MSR_AMD64_SEV_ES_GHCB);
+	while (npages) {
+		u64 chunk = min_t(u64, npages,
+				  SEV_SNAPSHOT_SHARED_STATE_NOTIFY_MAX_RUN_PAGES);
+		u64 gfn = gpa >> PAGE_SHIFT;
+		u64 notify;
+
+		if (WARN_ON_ONCE(gfn > U32_MAX))
+			break;
+
+		notify = SEV_SNAPSHOT_SHARED_STATE_NOTIFY_VALUE |
+			 ((u64)op << 52) |
+			 ((chunk - 1) << 44) |
+			 (gfn << PAGE_SHIFT);
+		native_wrmsrl(MSR_AMD64_SEV_ES_GHCB, notify);
+		VMGEXIT();
+
+		gpa += chunk << PAGE_SHIFT;
+		npages -= chunk;
+	}
+	native_wrmsrl(MSR_AMD64_SEV_ES_GHCB, ghcb_msr);
+	local_irq_restore(flags);
+}
+
 static bool sev_snapshot_shared_extent_contains_locked(u64 gpa, u64 npages)
 {
 	u64 end = gpa + (npages << PAGE_SHIFT);
@@ -759,6 +797,10 @@ static void sev_snapshot_flush_shared_extent_array(
 	       count * sizeof(*shared_extents));
 	WRITE_ONCE(*shared_extent_count, count);
 	raw_spin_unlock_irqrestore(&sev_snapshot_shared_lock, flags);
+
+	if (sev_snapshot_vmpl_mode && count)
+		sev_snapshot_notify_vmpl0_page_state_pa(0, 1,
+							SNP_PAGE_STATE_SHARED);
 }
 
 static void sev_snapshot_flush_shared_extents_v2(
