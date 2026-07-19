@@ -746,7 +746,8 @@ struct page *snp_safe_alloc_page(struct kvm_vcpu *vcpu);
 void sev_adjust_mapping_level(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn, int *level);
 void handle_rmp_page_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code);
 bool sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu);
-int sev_snp_switch_vmpl(struct kvm_vcpu *vcpu, unsigned int vmpl);
+int sev_snp_switch_vmpl(struct kvm_vcpu *vcpu, unsigned int vmpl, u32 flags,
+			u64 ghcb_msr);
 int sev_snp_get_vmpl(struct kvm_vcpu *vcpu, unsigned int *vmpl);
 int sev_update_mem_attr(struct kvm_memory_slot *slot, unsigned int attr,
 			gfn_t start, gfn_t end);

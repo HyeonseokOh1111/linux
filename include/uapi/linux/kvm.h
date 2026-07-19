@@ -2340,7 +2340,10 @@ struct kvm_s390_zpci_op {
 struct kvm_snp_vmpl {
 	__u32 vmpl;
 	__u32 flags;
+	__u64 ghcb_msr;
 };
+
+#define KVM_SNP_VMPL_SWITCH_F_FORWARD_GHCB_MSR	(1U << 0)
 
 struct kvm_memory_attributes {
 	__u64 address;

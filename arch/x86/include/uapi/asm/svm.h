@@ -118,6 +118,7 @@
 #define SVM_VMGEXIT_AP_VMPL_MASK		GENMASK(19, 16)
 #define SVM_VMGEXIT_AP_VMPL_SHIFT		16
 #define SVM_VMGEXIT_RUN_VMPL			0x80000018
+#define SVM_VMGEXIT_FAASEV_VMPL0_SERVICE	0x8000fa05
 #define SVM_VMGEXIT_HV_FEATURES			0x8000fffd
 #define SVM_VMGEXIT_TERM_REQUEST		0x8000fffe
 #define SVM_VMGEXIT_UNSUPPORTED_EVENT		0x8000ffff
@@ -234,6 +235,7 @@
 	{ SVM_VMGEXIT_GUEST_REQUEST,	"vmgexit_guest_request" }, \
 	{ SVM_VMGEXIT_EXT_GUEST_REQUEST, "vmgexit_ext_guest_request" }, \
 	{ SVM_VMGEXIT_AP_CREATION,	"vmgexit_ap_creation" }, \
+	{ SVM_VMGEXIT_FAASEV_VMPL0_SERVICE, "vmgexit_faasev_vmpl0_service" }, \
 	{ SVM_VMGEXIT_HV_FEATURES,	"vmgexit_hypervisor_feature" }, \
 	{ SVM_EXIT_ERR,         "invalid_guest_state" }
 

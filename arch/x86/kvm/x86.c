@@ -5979,7 +5979,7 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 		r = -EFAULT;
 		if (copy_from_user(&params, argp, sizeof(params)))
 			goto out;
-		if (params.flags) {
+		if (params.flags & ~KVM_SNP_VMPL_SWITCH_F_FORWARD_GHCB_MSR) {
 			r = -EINVAL;
 			break;
 		}
@@ -5987,7 +5987,9 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 			r = -EOPNOTSUPP;
 			break;
 		}
-		r = static_call(kvm_x86_switch_vmpl)(vcpu, params.vmpl);
+		r = static_call(kvm_x86_switch_vmpl)(vcpu, params.vmpl,
+						     params.flags,
+						     params.ghcb_msr);
 		break;
 	}
 	case KVM_SNP_GET_VMPL: {
