@@ -96,8 +96,6 @@ static u8 sev_snapshot_restore_xsave[PAGE_SIZE] __aligned(64);
 static u8 sev_snapshot_restore_gdt_pages[SEV_SNAPSHOT_V2_MAX_CPUS][PAGE_SIZE]
 	__page_aligned_bss;
 
-static phys_addr_t sev_snapshot_mailbox_pa;
-static u64 sev_snapshot_mailbox_len;
 static raw_spinlock_t sev_snapshot_shared_lock;
 static DEFINE_MUTEX(sev_snapshot_transport_lock);
 static bool sev_snapshot_shared_ready;
@@ -191,37 +189,12 @@ early_param("faasev_vmpl", sev_snapshot_vmpl_mode_setup);
 
 static __always_inline struct sev_snapshot_mailbox *sev_snapshot_mailbox_va(void)
 {
-	if (!sev_snapshot_mailbox_pa || !sev_snapshot_mailbox_len)
-		return NULL;
-
-	return __va(sev_snapshot_mailbox_pa);
+	return NULL;
 }
 
 bool sev_snapshot_range_is_mailbox_pa(unsigned long paddr, unsigned int npages)
 {
-	u64 start, end, mailbox_start, mailbox_len, mailbox_end, size;
-
-	if (!npages)
-		return false;
-
-	start = paddr & PAGE_MASK;
-	size = (u64)npages << PAGE_SHIFT;
-	end = start + size;
-	if (end < start)
-		return false;
-
-	mailbox_start = sev_snapshot_mailbox_pa;
-	mailbox_len = sev_snapshot_mailbox_len;
-	if (!mailbox_start || !mailbox_len) {
-		mailbox_start = SEV_SNAPSHOT_FIXED_MAILBOX_PA;
-		mailbox_len = SEV_SNAPSHOT_MAILBOX_SIZE;
-	}
-
-	mailbox_end = mailbox_start + mailbox_len;
-	if (mailbox_end < mailbox_start)
-		return false;
-
-	return start >= mailbox_start && end <= mailbox_end;
+	return false;
 }
 
 static __always_inline struct sev_snapshot_mailbox *sev_snapshot_restore_mailbox_va(void)
@@ -440,9 +413,6 @@ static bool __init sev_snapshot_range_is_ram(u64 start, u64 size)
 
 static phys_addr_t sev_snapshot_transport_page_pa(u64 offset)
 {
-	if (!sev_snapshot_mailbox_pa || !sev_snapshot_mailbox_len)
-		return 0;
-
 	if (offset > SEV_SNAPSHOT_CONTROL_SHARED_SIZE ||
 	    PAGE_SIZE > SEV_SNAPSHOT_CONTROL_SHARED_SIZE - offset)
 		return 0;
@@ -452,9 +422,6 @@ static phys_addr_t sev_snapshot_transport_page_pa(u64 offset)
 
 static int sev_snapshot_map_transport_pages(void)
 {
-	if (!sev_snapshot_mailbox_pa || !sev_snapshot_mailbox_len)
-		return -ENODEV;
-
 	mutex_lock(&sev_snapshot_transport_lock);
 	sev_snapshot_map_request_page_locked();
 	mutex_unlock(&sev_snapshot_transport_lock);
@@ -647,6 +614,7 @@ void sev_snapshot_track_page_state_pa(unsigned long paddr, unsigned int npages,
 {
 	unsigned long flags;
 	u64 gpa;
+	bool notify = false;
 
 	if (!npages)
 		return;
@@ -657,11 +625,17 @@ void sev_snapshot_track_page_state_pa(unsigned long paddr, unsigned int npages,
 	gpa = paddr & PAGE_MASK;
 
 	raw_spin_lock_irqsave(&sev_snapshot_shared_lock, flags);
-	if (op == SNP_PAGE_STATE_SHARED)
+	if (op == SNP_PAGE_STATE_SHARED) {
 		sev_snapshot_add_shared_extent_locked(gpa, npages);
-	else if (op == SNP_PAGE_STATE_PRIVATE)
+		notify = true;
+	} else if (op == SNP_PAGE_STATE_PRIVATE) {
 		sev_snapshot_remove_shared_extent_locked(gpa, npages);
+		notify = true;
+	}
 	raw_spin_unlock_irqrestore(&sev_snapshot_shared_lock, flags);
+
+	if (notify)
+		sev_snapshot_notify_vmpl0_page_state_pa(gpa, npages, op);
 }
 
 static bool sev_snapshot_direct_map_entry(unsigned long vaddr,
@@ -769,9 +743,13 @@ static void sev_snapshot_rebuild_shared_extents_from_direct_map(void)
 			continue;
 		}
 
-		if (!(entry & sme_me_mask))
-			sev_snapshot_track_page_state_pa(paddr, npages,
-							 SNP_PAGE_STATE_SHARED);
+		if (!(entry & sme_me_mask)) {
+			unsigned long flags;
+
+			raw_spin_lock_irqsave(&sev_snapshot_shared_lock, flags);
+			sev_snapshot_add_shared_extent_locked(paddr, npages);
+			raw_spin_unlock_irqrestore(&sev_snapshot_shared_lock, flags);
+		}
 
 		pfn += npages;
 	}
@@ -785,11 +763,12 @@ static void sev_snapshot_flush_shared_extent_array(
 	unsigned long flags;
 	u32 capacity, count;
 
-	if (!shared_extent_count || !shared_extents || header_len >= sev_snapshot_mailbox_len)
+	if (!shared_extent_count || !shared_extents ||
+	    header_len >= SEV_SNAPSHOT_MAILBOX_SIZE)
 		return;
 
 	raw_spin_lock_irqsave(&sev_snapshot_shared_lock, flags);
-	capacity = (sev_snapshot_mailbox_len - header_len) / sizeof(*shared_extents);
+	capacity = (SEV_SNAPSHOT_MAILBOX_SIZE - header_len) / sizeof(*shared_extents);
 	count = min_t(u32, sev_snapshot_shared_extent_count,
 		      SEV_SNAPSHOT_SHARED_EXTENT_MAX);
 	count = min(count, capacity);
@@ -822,16 +801,13 @@ static void sev_snapshot_flush_shared_extents_v2(
 static size_t sev_snapshot_mailbox_v2_written_len(
 	struct sev_snapshot_mailbox_v2 *mailbox)
 {
-	size_t mailbox_len = sev_snapshot_mailbox_len;
+	size_t mailbox_len = SEV_SNAPSHOT_MAILBOX_SIZE;
 	size_t shared_extents_offset;
 	size_t shared_extents_len;
 	u32 shared_extent_count;
 
 	if (!mailbox)
 		return 0;
-
-	if (!mailbox_len)
-		mailbox_len = SEV_SNAPSHOT_MAILBOX_SIZE;
 
 	shared_extents_offset = READ_ONCE(mailbox->header.cpu_bundle_len) +
 				2 * sizeof(u32);
@@ -852,7 +828,6 @@ static size_t sev_snapshot_mailbox_v2_written_len(
 
 static void sev_snapshot_shared_init(void)
 {
-	struct sev_snapshot_mailbox *mailbox;
 	bool do_seed = false;
 	unsigned long flags;
 	u64 start, end;
@@ -860,10 +835,6 @@ static void sev_snapshot_shared_init(void)
 	raw_spin_lock_irqsave(&sev_snapshot_shared_lock, flags);
 
 	if (sev_snapshot_shared_ready)
-		goto out_unlock;
-
-	mailbox = sev_snapshot_mailbox_va();
-	if (!mailbox)
 		goto out_unlock;
 
 	sev_snapshot_shared_ready = true;
@@ -1098,24 +1069,16 @@ static int sev_snapshot_signal_host_capture_canonical_irqoff(void)
 
 static int sev_snapshot_prepare_capture(void)
 {
-	struct sev_snapshot_mailbox *mailbox;
 	long ret;
 
 	ret = sev_snapshot_map_transport_pages();
 	if (ret)
 		return ret;
 
-	if (!sev_snapshot_mailbox_pa || !sev_snapshot_mailbox_len)
-		return -ENODEV;
-
 	sev_snapshot_shared_init();
 	ret = sev_snapshot_encrypt_init_scratch_decrypted_pages();
 	if (ret)
 		return ret;
-
-	mailbox = sev_snapshot_mailbox_va();
-	if (!mailbox)
-		return -ENODEV;
 
 	return 0;
 }
@@ -1571,14 +1534,8 @@ static long sev_snapshot_capture_final(const struct pt_regs *regs)
 
 static long sev_snapshot_capture_vmpl_vmsa_primary(void)
 {
-	struct sev_snapshot_mailbox *mailbox;
-	struct sev_snapshot_mailbox_v2 *mailbox_v2;
 	u32 cpu_count;
 	long ret;
-
-	mailbox = sev_snapshot_mailbox_va();
-	if (!mailbox)
-		return -ENODEV;
 
 	if (raw_smp_processor_id())
 		return -EINVAL;
@@ -1587,9 +1544,6 @@ static long sev_snapshot_capture_vmpl_vmsa_primary(void)
 	if (cpu_count != SEV_SNAPSHOT_V2_MIN_CPUS ||
 	    !sev_snapshot_v2_online_cpus_match(cpu_count))
 		return -EINVAL;
-
-	mailbox_v2 = (struct sev_snapshot_mailbox_v2 *)mailbox;
-	sev_snapshot_init_mailbox_v2_vmsa_only(mailbox_v2, cpu_count);
 
 	sev_snapshot_restore_debug_code(0x73);
 	ret = sev_snapshot_vmpl_freeze_virtio_devices();
@@ -1604,9 +1558,6 @@ static long sev_snapshot_capture_vmpl_vmsa_primary(void)
 	sev_snapshot_restore_debug_code(0x77);
 	sev_snapshot_rebuild_shared_extents_from_direct_map();
 	sev_snapshot_restore_debug_code(0x78);
-	sev_snapshot_flush_shared_extents_v2(mailbox_v2);
-	clflush_cache_range(mailbox_v2,
-			    sev_snapshot_mailbox_v2_written_len(mailbox_v2));
 	wmb();
 	sev_snapshot_restore_debug_code(0x79);
 
@@ -2236,72 +2187,9 @@ void __noreturn sev_snapshot_restore_from_desc(
 
 void __init sev_mailbox_reserve_from_setup_data(struct boot_params *bp)
 {
-	u64 pa_data;
-
-	if (!bp)
-		return;
-
-	pa_data = bp->hdr.setup_data;
-	while (pa_data) {
-		struct setup_data *hdr;
-		struct sev_snapshot_mailbox_desc desc;
-		u64 next;
-		u32 len;
-
-		hdr = early_memremap(pa_data, sizeof(*hdr));
-		if (!hdr) {
-			pr_err("failed to map setup_data while scanning for SEV snapshot mailbox\n");
-			return;
-		}
-
-		next = hdr->next;
-		len = hdr->len;
-
-		if (hdr->type != SETUP_SEV_SNAPSHOT_MAILBOX) {
-			early_memunmap(hdr, sizeof(*hdr));
-			pa_data = next;
-			continue;
-		}
-
-		if (len < sizeof(desc)) {
-			early_memunmap(hdr, sizeof(*hdr));
-			pr_err("ignoring short SEV snapshot mailbox descriptor\n");
-			return;
-		}
-
-		early_memunmap(hdr, sizeof(*hdr));
-
-		hdr = early_memremap(pa_data, sizeof(*hdr) + len);
-		if (!hdr) {
-			pr_err("failed to remap SEV snapshot mailbox descriptor\n");
-			return;
-		}
-
-		memcpy(&desc, hdr->data, sizeof(desc));
-		early_memunmap(hdr, sizeof(*hdr) + len);
-
-		if (!desc.phys_addr || desc.size != SEV_SNAPSHOT_MAILBOX_SIZE ||
-		    (desc.phys_addr & (SEV_SNAPSHOT_MAILBOX_SIZE - 1)) ||
-		    desc.phys_addr == (~(u64)(SEV_SNAPSHOT_MAILBOX_SIZE - 1))) {
-			pr_err("ignoring SEV snapshot mailbox descriptor with invalid address/size\n");
-			return;
-		}
-
-		if (!sev_snapshot_range_is_ram(desc.phys_addr, desc.size))
-			pr_warn("SEV snapshot mailbox backing is not visible yet during early setup; reserving descriptor range anyway\n");
-
-		if (memblock_is_region_reserved(desc.phys_addr, desc.size)) {
-			pr_err("SEV snapshot mailbox overlaps an already reserved range\n");
-			return;
-		}
-
-		if (memblock_reserve(desc.phys_addr, desc.size)) {
-			pr_err("failed to reserve SEV snapshot mailbox range\n");
-			return;
-		}
-
-		sev_snapshot_mailbox_pa = desc.phys_addr;
-		sev_snapshot_mailbox_len = desc.size;
-		return;
-	}
+	/*
+	 * VMSA-only VMPL restore no longer exposes a Linux-visible snapshot
+	 * mailbox.  Keep the init hook as a no-op while older call sites and
+	 * configs are phased out.
+	 */
 }

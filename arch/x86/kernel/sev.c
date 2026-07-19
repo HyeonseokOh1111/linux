@@ -433,6 +433,7 @@ static __always_inline void faasev_early_ghcb_debug(u8 code)
 	sev_es_wr_ghcb_msr(old_ghcb_msr);
 }
 
+bool faasev_vmpl_boot_early __section(".data");
 static bool faasev_vmpl_boot;
 
 static int __init parse_faasev_vmpl(char *arg)
@@ -443,40 +444,58 @@ static int __init parse_faasev_vmpl(char *arg)
 
 early_param("faasev_vmpl", parse_faasev_vmpl);
 
-static bool faasev_vmpl_requested_on_cmdline(void)
+static bool __init faasev_cmdline_requests_vmpl(const char *cmdline)
 {
-	const char option[] = "faasev_vmpl=1";
-	unsigned int pos = 0;
+	char value[2] = {};
+	int len;
 
-	while (pos < COMMAND_LINE_SIZE && boot_command_line[pos]) {
-		unsigned int i = 0;
+	if (!cmdline)
+		return false;
 
-		while (pos < COMMAND_LINE_SIZE && boot_command_line[pos] == ' ')
-			pos++;
-		if (pos >= COMMAND_LINE_SIZE || !boot_command_line[pos])
-			break;
+	len = cmdline_find_option(cmdline, "faasev_vmpl", value, sizeof(value));
+	if (len >= 0)
+		return len == 0 || value[0] == '1';
 
-		while (i < sizeof(option) - 1 &&
-		       pos + i < COMMAND_LINE_SIZE &&
-		       boot_command_line[pos + i] == option[i])
-			i++;
-		if (i == sizeof(option) - 1 &&
-		    (pos + i >= COMMAND_LINE_SIZE ||
-		     !boot_command_line[pos + i] ||
-		     boot_command_line[pos + i] == ' '))
-			return true;
-
-		while (pos < COMMAND_LINE_SIZE && boot_command_line[pos] &&
-		       boot_command_line[pos] != ' ')
-			pos++;
-	}
-
-	return false;
+	return cmdline_find_option_bool(cmdline, "faasev_vmpl") > 0;
 }
 
-static bool faasev_vmpl_active_early(void)
+static const char *__init faasev_boot_params_cmdline(void)
 {
-	return faasev_vmpl_boot || faasev_vmpl_requested_on_cmdline();
+	unsigned long cmdline_paddr = boot_params.hdr.cmd_line_ptr;
+
+	cmdline_paddr |= (u64)boot_params.ext_cmd_line_ptr << 32;
+	if (!cmdline_paddr)
+		return NULL;
+
+	return __va(cmdline_paddr);
+}
+
+static bool __init faasev_vmpl_requested_on_cmdline(void)
+{
+	if (faasev_cmdline_requests_vmpl(boot_command_line))
+		return true;
+
+	return faasev_cmdline_requests_vmpl(faasev_boot_params_cmdline());
+}
+
+static bool __init faasev_vmpl_active_early(void)
+{
+	if (faasev_vmpl_boot) {
+		faasev_early_ghcb_debug(0x72);
+		return true;
+	}
+	if (faasev_vmpl_boot_early) {
+		faasev_early_ghcb_debug(0x73);
+		faasev_vmpl_boot = true;
+		return true;
+	}
+	if (faasev_vmpl_requested_on_cmdline()) {
+		faasev_early_ghcb_debug(0x74);
+		faasev_vmpl_boot = true;
+		return true;
+	}
+	faasev_early_ghcb_debug(0x75);
+	return false;
 }
 
 static int vc_fetch_insn_kernel(struct es_em_ctxt *ctxt,
@@ -1024,6 +1043,19 @@ void __init early_snp_set_memory_private(unsigned long vaddr, unsigned long padd
 		return;
 	}
 
+	/*
+	 * In the VMPL boot path, VMPL0 owns the guest-private RAM acceptance and
+	 * lower-VMPL permission grants before handing off to VMPL1. A fresh host
+	 * PSC private request here can RMPUPDATE the page and drop VMPL1 access
+	 * before Linux has a chance to run. Treat early private conversion as an
+	 * idempotent no-op until the normal VMPL0-mediated page-state tracking is
+	 * online.
+	 */
+	if (faasev_vmpl_active_early()) {
+		faasev_early_ghcb_debug(0x5b);
+		return;
+	}
+
 	 /*
 	  * Ask the hypervisor to mark the memory pages as private in the RMP
 	  * table.
@@ -1033,10 +1065,7 @@ void __init early_snp_set_memory_private(unsigned long vaddr, unsigned long padd
 	faasev_early_ghcb_debug(0xa2);
 
 	/* Validate the memory pages after they've been added in the RMP table. */
-	if (faasev_vmpl_boot)
-		faasev_early_ghcb_debug(0x5b);
-	else
-		pvalidate_pages(vaddr, npages, true);
+	pvalidate_pages(vaddr, npages, true);
 
 	faasev_early_ghcb_debug(0xa3);
 }
@@ -1058,14 +1087,20 @@ void __init early_snp_set_memory_shared(unsigned long vaddr, unsigned long paddr
 	faasev_early_ghcb_debug(0xa5);
 
 	/*
-	 * A lower-VMPL Linux guest cannot safely perform the devalidate step
-	 * itself during early boot. The VMPL template path lets the host/VMPL0
-	 * PSC handler own the RMP transition instead.
+	 * A lower-VMPL Linux guest cannot safely perform the devalidate/PSC
+	 * sequence itself during early boot. Route the transition through the
+	 * VMPL0-owned shared-state table path; VMPL0 will mediate the host page
+	 * state change and keep the authoritative shared extent state.
 	 */
-	if (faasev_vmpl_boot)
+	if (faasev_vmpl_active_early()) {
 		faasev_early_ghcb_debug(0x5a);
-	else
-		pvalidate_pages(vaddr, npages, false);
+		sev_snapshot_track_page_state_pa(paddr, npages,
+						 SNP_PAGE_STATE_SHARED);
+		faasev_early_ghcb_debug(0xa7);
+		return;
+	}
+
+	pvalidate_pages(vaddr, npages, false);
 
 	faasev_early_ghcb_debug(0xa6);
 
@@ -1245,6 +1280,11 @@ void snp_set_memory_shared(unsigned long vaddr, unsigned int npages)
 	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
 		return;
 
+	if (faasev_vmpl_boot) {
+		sev_snapshot_track_page_state(vaddr, npages, SNP_PAGE_STATE_SHARED);
+		return;
+	}
+
 	if (!faasev_vmpl_boot)
 		pvalidate_pages(vaddr, npages, false);
 
@@ -1259,6 +1299,11 @@ void snp_set_memory_private(unsigned long vaddr, unsigned int npages)
 	if (faasev_vmpl_boot &&
 	    sev_snapshot_range_is_mailbox_pa(__pa(vaddr), npages))
 		return;
+
+	if (faasev_vmpl_boot) {
+		sev_snapshot_track_page_state(vaddr, npages, SNP_PAGE_STATE_PRIVATE);
+		return;
+	}
 
 	set_pages_state(vaddr, npages, SNP_PAGE_STATE_PRIVATE);
 

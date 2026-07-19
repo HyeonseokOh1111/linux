@@ -728,8 +728,17 @@ void early_setup_idt(void)
 /*
  * Setup boot CPU state needed before kernel switches to virtual addresses.
  */
-void __head startup_64_setup_env(unsigned long physbase)
+void __head startup_64_setup_env(unsigned long physbase, struct boot_params *bp)
 {
+	bool *vmpl_boot_ptr;
+
+	vmpl_boot_ptr = fixup_pointer(&faasev_vmpl_boot_early, physbase);
+	*vmpl_boot_ptr = faasev_vmpl_boot(bp);
+	if (*vmpl_boot_ptr)
+		FAASEV_GHCB_DEBUG(0x76);
+	else
+		FAASEV_GHCB_DEBUG(0x77);
+
 	/* Load GDT */
 	startup_gdt_descr.address = (unsigned long)fixup_pointer(startup_gdt, physbase);
 	native_load_gdt(&startup_gdt_descr);

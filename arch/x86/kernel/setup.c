@@ -819,7 +819,6 @@ static void __init early_reserve_memory(void)
 
 	memblock_x86_reserve_range_setup_data();
 	FAASEV_SETUP_ARCH_DEBUG(0xca);
-	sev_mailbox_reserve_from_setup_data(&boot_params);
 	FAASEV_SETUP_ARCH_DEBUG(0xcb);
 
 	reserve_ibft_region();
@@ -1293,7 +1292,6 @@ void __init setup_arch(char **cmdline_p)
 	 * this call?
 	 */
 	sync_initial_page_table();
-	FAASEV_SETUP_ARCH_DEBUG(0xae);
 
 	tboot_probe();
 
@@ -1364,7 +1362,6 @@ void __init setup_arch(char **cmdline_p)
 #endif
 
 	unwind_init();
-	FAASEV_SETUP_ARCH_DEBUG(0xaf);
 }
 
 #ifdef CONFIG_X86_32
