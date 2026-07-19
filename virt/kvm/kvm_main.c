@@ -2628,7 +2628,8 @@ static void kvm_mem_attrs_changed(struct kvm *kvm, unsigned long attrs,
 }
 
 static void kvm_post_mem_attrs_changed(struct kvm *kvm, unsigned long attrs,
-				       gfn_t start_orig, gfn_t end_orig)
+				       u64 flags, gfn_t start_orig,
+				       gfn_t end_orig)
 {
 	struct kvm_memory_slot *slot;
 	struct kvm_memslots *slots;
@@ -2648,7 +2649,8 @@ static void kvm_post_mem_attrs_changed(struct kvm *kvm, unsigned long attrs,
 			if (start >= end)
 				continue;
 
-			kvm_arch_post_set_memory_attributes(kvm, slot, attrs, start, end);
+			kvm_arch_post_set_memory_attributes(kvm, slot, attrs,
+							    flags, start, end);
 		}
 	}
 }
@@ -2675,11 +2677,14 @@ static int kvm_vm_ioctl_set_mem_attributes(struct kvm *kvm,
 {
 	gfn_t start, end;
 	unsigned long i;
+	const u64 valid_flags = KVM_MEMORY_ATTRIBUTE_FAASEV_ALLOW_HUGE_PRIVATE;
 
-	/* flags is currently not used. */
-	if (attrs->flags)
+	if (attrs->flags & ~valid_flags)
 		return -EINVAL;
 	if (attrs->attributes & ~kvm_supported_mem_attributes(kvm))
+		return -EINVAL;
+	if ((attrs->flags & KVM_MEMORY_ATTRIBUTE_FAASEV_ALLOW_HUGE_PRIVATE) &&
+	    !(attrs->attributes & KVM_MEMORY_ATTRIBUTE_PRIVATE))
 		return -EINVAL;
 	if (attrs->size == 0 || attrs->address + attrs->size < attrs->address)
 		return -EINVAL;
@@ -2705,7 +2710,8 @@ static int kvm_vm_ioctl_set_mem_attributes(struct kvm *kvm,
 	KVM_MMU_UNLOCK(kvm);
 
 	if (i > start)
-		kvm_post_mem_attrs_changed(kvm, attrs->attributes, start, i);
+		kvm_post_mem_attrs_changed(kvm, attrs->attributes,
+					   attrs->flags, start, i);
 
 	mutex_unlock(&kvm->slots_lock);
 

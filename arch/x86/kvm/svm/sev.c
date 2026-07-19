@@ -5045,11 +5045,13 @@ static int sev_make_private_4k_range(struct kvm_memory_slot *slot,
 }
 
 int sev_update_mem_attr(struct kvm_memory_slot *slot, unsigned int attr,
-			gfn_t start, gfn_t end)
+			u64 flags, gfn_t start, gfn_t end)
 {
 	struct kvm_sev_info *sev = &to_kvm_svm(slot->kvm)->sev_info;
 	enum psc_op op = (attr & KVM_MEMORY_ATTRIBUTE_PRIVATE) ? SNP_PAGE_STATE_PRIVATE
 							       : SNP_PAGE_STATE_SHARED;
+	bool allow_huge_private =
+		flags & KVM_MEMORY_ATTRIBUTE_FAASEV_ALLOW_HUGE_PRIVATE;
 	gfn_t gfn = start;
 
 	pr_debug("%s: GFN 0x%llx - 0x%llx, op: %d\n", __func__, start, end, op);
@@ -5066,11 +5068,11 @@ int sev_update_mem_attr(struct kvm_memory_slot *slot, unsigned int attr,
 	while (gfn < end) {
 		kvm_pfn_t pfn;
 		int level = PG_LEVEL_4K; /* TODO: take actual order into account */
-			gpa_t gpa = gfn_to_gpa(gfn);
-			int npages = 1;
-			int order;
-			int rmp_level;
-			int rc;
+		gpa_t gpa = gfn_to_gpa(gfn);
+		int npages = 1;
+		int order;
+		int rmp_level;
+		int rc;
 
 		/*
 		 * No work to do if there was never a page allocated from private
@@ -5108,10 +5110,31 @@ int sev_update_mem_attr(struct kvm_memory_slot *slot, unsigned int attr,
 					level = target_level;
 					npages = 1 << order;
 				}
-			} else if (op == SNP_PAGE_STATE_PRIVATE &&
-				   sev_snp_huge_rmpupdate_enabled) {
-				pr_warn_once("%s: huge private RMPUPDATE disabled for VMPL snapshot path; using 4 KiB updates\n",
-					     __func__);
+			} else if (op == SNP_PAGE_STATE_PRIVATE) {
+				int target_level = order_to_level(order);
+
+				if (sev_snp_huge_rmpupdate_enabled && allow_huge_private) {
+					rc = snp_lookup_rmpentry(pfn, &rmp_level);
+					if (rc < 0) {
+						put_page(pfn_to_page(pfn));
+						return -EINVAL;
+					}
+
+					/*
+					 * Use a huge private RMPUPDATE only for an unassigned
+					 * huge range, or for a range that is already represented
+					 * by a huge RMP entry.  If the first subpage is assigned
+					 * at 4 KiB granularity, keep the bounded 4 KiB path so
+					 * mixed pages are not skipped as a false huge range.
+					 */
+					if (!rc || rmp_level == target_level) {
+						level = target_level;
+						npages = 1 << order;
+					}
+				} else if (sev_snp_huge_rmpupdate_enabled) {
+					pr_warn_once("%s: huge private RMPUPDATE disabled for VMPL snapshot path; using 4 KiB updates\n",
+						     __func__);
+				}
 			}
 		}
 
@@ -5124,7 +5147,7 @@ int sev_update_mem_attr(struct kvm_memory_slot *slot, unsigned int attr,
 	 * now just take the let KVM MMU handle faulting it on the next
 	 * access.
 	 */
-			switch (op) {
+		switch (op) {
 		case SNP_PAGE_STATE_SHARED:
 			rc = snp_make_page_shared(slot->kvm, gpa, pfn, level);
 			break;
@@ -5152,22 +5175,22 @@ int sev_update_mem_attr(struct kvm_memory_slot *slot, unsigned int attr,
 						    __func__, gpa, pfn, level, rc);
 				put_page(pfn_to_page(pfn));
 
-			rc = sev_make_private_4k_range(slot, gfn, gfn + npages,
-						       sev->asid);
-			if (rc) {
-				pr_err_ratelimited("%s: 4 KiB fallback failed op %d gpa %llx level %d rc %d\n",
-						   __func__, op, gpa, level, rc);
-				return -EINVAL;
-			}
+				rc = sev_make_private_4k_range(slot, gfn, gfn + npages,
+							       sev->asid);
+				if (rc) {
+					pr_err_ratelimited("%s: 4 KiB fallback failed op %d gpa %llx level %d rc %d\n",
+							   __func__, op, gpa, level, rc);
+					return -EINVAL;
+				}
 
-			gfn += npages;
-			continue;
+				gfn += npages;
+				continue;
+			}
+			break;
+		default:
+			rc = PSC_INVALID_ENTRY;
+			break;
 		}
-		break;
-	default:
-		rc = PSC_INVALID_ENTRY;
-		break;
-	}
 
 		put_page(pfn_to_page(pfn));
 

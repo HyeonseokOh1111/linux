@@ -2353,5 +2353,6 @@ struct kvm_memory_attributes {
 };
 
 #define KVM_MEMORY_ATTRIBUTE_PRIVATE           (1ULL << 3)
+#define KVM_MEMORY_ATTRIBUTE_FAASEV_ALLOW_HUGE_PRIVATE (1ULL << 0)
 
 #endif /* __LINUX_KVM_H */
