@@ -1031,19 +1031,6 @@ void __init early_snp_set_memory_private(unsigned long vaddr, unsigned long padd
 	faasev_early_ghcb_debug(0xa1);
 
 	/*
-	 * In the VMPL template path the snapshot recorder has already accepted
-	 * the private mailbox and granted VMPL1 access with RMPADJUST. Sending a
-	 * fresh host PSC private request for the mailbox would RMPUPDATE the
-	 * entry and clear those lower-VMPL permissions, causing VMPL1 RMP faults
-	 * when it later writes the snapshot context.
-	 */
-	if (faasev_vmpl_active_early() &&
-	    sev_snapshot_range_is_mailbox_pa(paddr, npages)) {
-		faasev_early_ghcb_debug(0x5c);
-		return;
-	}
-
-	/*
 	 * In the VMPL boot path, VMPL0 owns the guest-private RAM acceptance and
 	 * lower-VMPL permission grants before handing off to VMPL1. A fresh host
 	 * PSC private request here can RMPUPDATE the page and drop VMPL1 access
@@ -1294,10 +1281,6 @@ void snp_set_memory_shared(unsigned long vaddr, unsigned int npages)
 void snp_set_memory_private(unsigned long vaddr, unsigned int npages)
 {
 	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
-		return;
-
-	if (faasev_vmpl_boot &&
-	    sev_snapshot_range_is_mailbox_pa(__pa(vaddr), npages))
 		return;
 
 	if (faasev_vmpl_boot) {
