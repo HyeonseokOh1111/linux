@@ -84,9 +84,6 @@
 #define SEV_SNAPSHOT_REQUEST_HOST_EVENT_SIGNAL	0x0051000000000014ULL
 #define SEV_SNAPSHOT_SHARED_STATE_NOTIFY_VALUE	0xf500000000000014ULL
 #define SEV_SNAPSHOT_SHARED_STATE_NOTIFY_MAX_RUN_PAGES	256UL
-#define SEV_SNAPSHOT_APIC_DIVISOR		16
-#define SEV_SNAPSHOT_FALLBACK_AP_TMICT		0x3d091U
-
 #define SEV_SNAPSHOT_SHARED_EXTENT_MAX		32768
 
 static raw_spinlock_t sev_snapshot_shared_lock;
@@ -105,8 +102,7 @@ static u32 sev_snapshot_shared_extent_count;
 extern char __init_scratch_begin[], __init_scratch_end[];
 
 static void sev_snapshot_map_request_page_locked(void);
-static void sev_snapshot_resume_local_tick(void);
-static void sev_snapshot_rearm_boot_local_apic_timer(void);
+static void sev_snapshot_quiesce_local_apic_timer(void);
 
 static __always_inline void sev_snapshot_restore_debug_code(u8 code)
 {
@@ -171,30 +167,6 @@ static void sev_snapshot_restore_current_affinity(void)
 		pr_warn("failed to restore snapshot task CPU affinity\n");
 
 	WRITE_ONCE(sev_snapshot_saved_cpus_allowed_valid, false);
-}
-
-static void sev_snapshot_drain_local_apic_isr(void)
-{
-	unsigned long flags;
-	unsigned int iter;
-	unsigned int reg;
-
-	local_irq_save(flags);
-	for (iter = 0; iter < APIC_ISR_NR * 32; iter++) {
-		bool has_isr = false;
-
-		for (reg = 0; reg < APIC_ISR_NR; reg++) {
-			if (apic_read(APIC_ISR + reg * 0x10)) {
-				has_isr = true;
-				break;
-			}
-		}
-		if (!has_isr)
-			break;
-
-		ack_APIC_irq();
-	}
-	local_irq_restore(flags);
 }
 
 static void sev_snapshot_clear_idle_polling_flags(void)
@@ -765,6 +737,7 @@ static long sev_snapshot_capture_vmpl_vmsa_primary(void)
 	local_irq_disable();
 
 	sev_snapshot_suspend_local_tick();
+	sev_snapshot_quiesce_local_apic_timer();
 	sev_snapshot_restore_debug_code(0x77);
 	sev_snapshot_rebuild_shared_extents_from_direct_map();
 	sev_snapshot_restore_debug_code(0x78);
@@ -789,11 +762,14 @@ static long sev_snapshot_capture_vmpl_vmsa_primary(void)
 	sev_snapshot_restore_debug_code(0xaa);
 	kvm_sev_snapshot_restore_reinit();
 	sev_snapshot_restore_debug_code(0xab);
-	sev_snapshot_drain_local_apic_isr();
+	/*
+	 * APIC timer state is not part of the VMSA-only restore contract.
+	 * Leave the LAPIC timer quiesced instead of trying to replay timer
+	 * continuity from stale KVM APIC state.
+	 */
+	sev_snapshot_quiesce_local_apic_timer();
 	sev_snapshot_clear_idle_polling_flags();
 	sev_snapshot_restore_debug_code(0xb0);
-	sev_snapshot_resume_local_tick();
-	sev_snapshot_rearm_boot_local_apic_timer();
 	ret = sev_snapshot_restore_virtio_devices();
 	if (ret)
 		goto out_restore_irqoff;
@@ -838,30 +814,12 @@ long sev_snapshot_arm(void)
 	return sev_snapshot_capture_vmpl_vmsa_primary();
 }
 
-static void sev_snapshot_resume_local_tick(void)
+static void sev_snapshot_quiesce_local_apic_timer(void)
 {
 	unsigned long flags;
 
 	local_irq_save(flags);
-	tick_resume_local();
-	local_irq_restore(flags);
-}
-
-static void sev_snapshot_rearm_boot_local_apic_timer(void)
-{
-	unsigned int tmict = SEV_SNAPSHOT_FALLBACK_AP_TMICT;
-	unsigned long flags;
-
-	if (lapic_timer_period)
-		tmict = lapic_timer_period / SEV_SNAPSHOT_APIC_DIVISOR;
-	if (!tmict)
-		tmict = SEV_SNAPSHOT_FALLBACK_AP_TMICT;
-
-	local_irq_save(flags);
-	apic_write(APIC_TASKPRI, 0);
-	apic_write(APIC_SPIV, APIC_SPIV_APIC_ENABLED | SPURIOUS_APIC_VECTOR);
-	apic_write(APIC_TDCR, APIC_TDR_DIV_16);
-	apic_write(APIC_LVTT, APIC_LVT_TIMER_PERIODIC | LOCAL_TIMER_VECTOR);
-	apic_write(APIC_TMICT, tmict);
+	apic_write(APIC_LVTT, APIC_LVT_MASKED | LOCAL_TIMER_VECTOR);
+	apic_write(APIC_TMICT, 0);
 	local_irq_restore(flags);
 }
