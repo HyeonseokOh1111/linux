@@ -32,11 +32,29 @@
 	pushq	%rax
 	pushq	%rcx
 	pushq	%rdx
+	pushq	%r8
+	pushq	%r9
 	movl	$MSR_AMD64_SEV_ES_GHCB, %ecx
+	rdmsr
+	movq	%rax, %r8
+	movq	%rdx, %r9
 	movl	$0x14, %eax
 	movl	$(\code << 16), %edx
 	wrmsr
 	rep; vmmcall
+	movl	$MSR_AMD64_SEV_ES_GHCB, %ecx
+	testl	$0xfff, %r8d
+	jnz	1f
+	movq	%r8, %rax
+	movq	%r9, %rdx
+	jmp	2f
+1:
+	xorl	%eax, %eax
+	xorl	%edx, %edx
+2:
+	wrmsr
+	popq	%r9
+	popq	%r8
 	popq	%rdx
 	popq	%rcx
 	popq	%rax

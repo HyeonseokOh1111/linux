@@ -30,6 +30,8 @@
 #include <linux/preempt.h>
 #include <linux/syscalls.h>
 #include <linux/uaccess.h>
+#include <crypto/aead.h>
+#include <linux/scatterlist.h>
 #include <uapi/linux/sev-guest.h>
 
 #include <asm/cpu_entry_area.h>
@@ -46,7 +48,6 @@
 #include <asm/cpu.h>
 #include <asm/apic.h>
 #include <asm/cpuid.h>
-#include <asm/cmdline.h>
 
 #include "sev_snapshot.h"
 
@@ -93,6 +94,15 @@ static bool faasev_vmpl_boot;
 #define FAASEV_VMPL0_SERVICE_STATUS_PENDING	1
 #define FAASEV_VMPL0_SERVICE_STATUS_OK		2
 #define FAASEV_VMPL0_SERVICE_PVALIDATE_VALIDATE	BIT(0)
+#define FAASEV_SHADOW_CRYPTO_RECORD_SIZE	512
+#define FAASEV_SHADOW_CRYPTO_TAG_LEN		16
+#define FAASEV_SHADOW_CRYPTO_IV_LEN		12
+#define FAASEV_SHADOW_CRYPTO_KEY_LEN		16
+#define FAASEV_SHADOW_CRYPTO_BUFFER_LEN		\
+	(FAASEV_SHADOW_CRYPTO_RECORD_SIZE + FAASEV_SHADOW_CRYPTO_TAG_LEN)
+#define FAASEV_VMPL0_SERVICE_CRYPTO_SIM_CLEAR_LEN	\
+	(FAASEV_VMPL0_SERVICE_HEADER_LEN +		\
+	 sizeof(struct faasev_vmpl0_service_crypto_sim))
 
 struct faasev_vmpl0_service_header {
 	u32 magic;
@@ -133,8 +143,8 @@ static int faasev_vmpl0_service_pvalidate_pages(unsigned long vaddr,
 						bool validate);
 static int faasev_vmpl0_service_crypto_sim(unsigned int operation,
 					   size_t payload_len);
-static void faasev_shadow_crypto_local_sim(unsigned int operation,
-					   size_t payload_len);
+static int faasev_shadow_crypto_local_sim(unsigned int operation,
+					  size_t payload_len);
 
 SYSCALL_DEFINE2(faasev_seed_input_key, const u8 __user *, input_key,
 		size_t, input_key_len)
@@ -160,8 +170,7 @@ SYSCALL_DEFINE2(faasev_shadow_crypto, unsigned int, operation,
 	if (faasev_vmpl_boot)
 		return faasev_vmpl0_service_crypto_sim(operation, payload_len);
 
-	faasev_shadow_crypto_local_sim(operation, payload_len);
-	return 0;
+	return faasev_shadow_crypto_local_sim(operation, payload_len);
 }
 
 /* #VC handler runtime per-CPU data */
@@ -398,7 +407,7 @@ static __always_inline void faasev_early_ghcb_debug(u8 code)
 
 	sev_es_wr_ghcb_msr(((u64)code << 48) | 0x14);
 	VMGEXIT();
-	sev_es_wr_ghcb_msr(old_ghcb_msr);
+	sev_es_wr_ghcb_msr((old_ghcb_msr & GHCB_MSR_INFO_MASK) ? 0 : old_ghcb_msr);
 }
 
 static int __init parse_faasev_vmpl(char *arg)
@@ -409,40 +418,6 @@ static int __init parse_faasev_vmpl(char *arg)
 
 early_param("faasev_vmpl", parse_faasev_vmpl);
 
-static bool __init faasev_cmdline_requests_vmpl(const char *cmdline)
-{
-	char value[2] = {};
-	int len;
-
-	if (!cmdline)
-		return false;
-
-	len = cmdline_find_option(cmdline, "faasev_vmpl", value, sizeof(value));
-	if (len >= 0)
-		return len == 0 || value[0] == '1';
-
-	return cmdline_find_option_bool(cmdline, "faasev_vmpl") > 0;
-}
-
-static const char *__init faasev_boot_params_cmdline(void)
-{
-	unsigned long cmdline_paddr = boot_params.hdr.cmd_line_ptr;
-
-	cmdline_paddr |= (u64)boot_params.ext_cmd_line_ptr << 32;
-	if (!cmdline_paddr)
-		return NULL;
-
-	return __va(cmdline_paddr);
-}
-
-static bool __init faasev_vmpl_requested_on_cmdline(void)
-{
-	if (faasev_cmdline_requests_vmpl(boot_command_line))
-		return true;
-
-	return faasev_cmdline_requests_vmpl(faasev_boot_params_cmdline());
-}
-
 static bool __init faasev_vmpl_active_early(void)
 {
 	if (faasev_vmpl_boot) {
@@ -451,11 +426,6 @@ static bool __init faasev_vmpl_active_early(void)
 	}
 	if (faasev_vmpl_boot_early) {
 		faasev_early_ghcb_debug(0x73);
-		faasev_vmpl_boot = true;
-		return true;
-	}
-	if (faasev_vmpl_requested_on_cmdline()) {
-		faasev_early_ghcb_debug(0x74);
 		faasev_vmpl_boot = true;
 		return true;
 	}
@@ -757,7 +727,8 @@ static int faasev_vmpl0_service_status_to_errno(u32 status)
 	return -EIO;
 }
 
-static int faasev_vmpl0_service_call_locked(struct faasev_vmpl0_service_page *svc)
+static int faasev_vmpl0_service_call_locked(struct faasev_vmpl0_service_page *svc,
+					    size_t clear_len)
 {
 	struct ghcb_state state;
 	struct es_em_ctxt ctxt = {};
@@ -794,7 +765,7 @@ static int faasev_vmpl0_service_call_locked(struct faasev_vmpl0_service_page *sv
 	ret = faasev_vmpl0_service_status_to_errno(svc->hdr.status);
 
 out_zero:
-	memzero_explicit(svc, sizeof(*svc));
+	memzero_explicit(svc, clear_len);
 	return ret;
 }
 
@@ -831,7 +802,7 @@ static int faasev_vmpl0_service_submit_pvalidate(phys_addr_t gpa,
 	svc->pvalidate.npages = npages;
 	svc->pvalidate.flags = validate ? FAASEV_VMPL0_SERVICE_PVALIDATE_VALIDATE : 0;
 
-	ret = faasev_vmpl0_service_call_locked(svc);
+	ret = faasev_vmpl0_service_call_locked(svc, sizeof(*svc));
 
 out_unlock:
 	local_irq_restore(flags);
@@ -874,22 +845,135 @@ static int faasev_vmpl0_service_pvalidate_pages(unsigned long vaddr,
 	return 0;
 }
 
-static void faasev_shadow_crypto_local_sim(unsigned int operation,
-					   size_t payload_len)
-{
-	const size_t sim_block_size = 16;
-	size_t block_count = DIV_ROUND_UP(payload_len, sim_block_size);
-	size_t index;
-	u64 acc = ((u64)operation << 32) ^ payload_len ^ 0x46535653494d0001ULL;
+static DEFINE_MUTEX(faasev_shadow_crypto_lock);
+static struct crypto_aead *faasev_shadow_crypto_tfm;
+static struct aead_request *faasev_shadow_crypto_req;
+static u8 faasev_shadow_crypto_buffer[FAASEV_SHADOW_CRYPTO_BUFFER_LEN] __aligned(16);
+static u8 faasev_shadow_crypto_iv[FAASEV_SHADOW_CRYPTO_IV_LEN] __aligned(16);
+static struct scatterlist faasev_shadow_crypto_sg;
+static const u8 faasev_shadow_crypto_key[FAASEV_SHADOW_CRYPTO_KEY_LEN] = {
+	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+	0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+};
 
-	for (index = 0; index < block_count; index++) {
-		acc ^= index * 0x9e3779b97f4a7c15ULL;
-		acc = (acc << 7) | (acc >> (64 - 7));
-		acc += operation == FAASEV_SHADOW_CRYPTO_DECRYPT ?
-		       0xd1ec7dec7dec7decULL : 0xe11ce11ce11ce11cULL;
+static void faasev_shadow_crypto_make_iv(unsigned int operation,
+					 u64 record_index)
+{
+	u64 low = 0x46535653474d0001ULL ^ record_index;
+	u32 high = 0xaead0000U ^ operation;
+	unsigned int i;
+
+	for (i = 0; i < 8; i++)
+		faasev_shadow_crypto_iv[i] = (low >> (i * 8)) & 0xff;
+	for (i = 0; i < 4; i++)
+		faasev_shadow_crypto_iv[8 + i] = (high >> (i * 8)) & 0xff;
+}
+
+static int faasev_shadow_crypto_init_locked(void)
+{
+	struct crypto_aead *tfm;
+	struct aead_request *req;
+	int ret;
+
+	if (faasev_shadow_crypto_req)
+		return 0;
+
+	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+
+	ret = crypto_aead_setkey(tfm, faasev_shadow_crypto_key,
+				 sizeof(faasev_shadow_crypto_key));
+	if (ret)
+		goto out_free_tfm;
+
+	ret = crypto_aead_setauthsize(tfm, FAASEV_SHADOW_CRYPTO_TAG_LEN);
+	if (ret)
+		goto out_free_tfm;
+
+	req = aead_request_alloc(tfm, GFP_KERNEL);
+	if (!req) {
+		ret = -ENOMEM;
+		goto out_free_tfm;
+	}
+
+	memset(faasev_shadow_crypto_buffer, 0xa5,
+	       sizeof(faasev_shadow_crypto_buffer));
+	faasev_shadow_crypto_tfm = tfm;
+	faasev_shadow_crypto_req = req;
+	return 0;
+
+out_free_tfm:
+	crypto_free_aead(tfm);
+	return ret;
+}
+
+static int __init faasev_shadow_crypto_init(void)
+{
+	int ret;
+
+	mutex_lock(&faasev_shadow_crypto_lock);
+	ret = faasev_shadow_crypto_init_locked();
+	mutex_unlock(&faasev_shadow_crypto_lock);
+	if (ret)
+		pr_warn("failed to initialize AES-GCM shadow crypto simulation: %d\n",
+			ret);
+	return 0;
+}
+late_initcall(faasev_shadow_crypto_init);
+
+static int faasev_shadow_crypto_local_sim(unsigned int operation,
+					  size_t payload_len)
+{
+	DECLARE_CRYPTO_WAIT(wait);
+	size_t record_count = DIV_ROUND_UP(payload_len,
+					   FAASEV_SHADOW_CRYPTO_RECORD_SIZE);
+	u64 record_index;
+	u64 acc = ((u64)operation << 32) ^ payload_len;
+	int ret;
+
+	mutex_lock(&faasev_shadow_crypto_lock);
+	ret = faasev_shadow_crypto_init_locked();
+	if (ret)
+		goto out_unlock;
+
+	aead_request_set_callback(faasev_shadow_crypto_req,
+				  CRYPTO_TFM_REQ_MAY_BACKLOG |
+				  CRYPTO_TFM_REQ_MAY_SLEEP,
+				  crypto_req_done, &wait);
+
+	for (record_index = 0; record_index < record_count; record_index++) {
+		faasev_shadow_crypto_make_iv(operation, record_index);
+		sg_init_one(&faasev_shadow_crypto_sg,
+			    faasev_shadow_crypto_buffer,
+			    sizeof(faasev_shadow_crypto_buffer));
+		aead_request_set_crypt(faasev_shadow_crypto_req,
+				       &faasev_shadow_crypto_sg,
+				       &faasev_shadow_crypto_sg,
+				       FAASEV_SHADOW_CRYPTO_RECORD_SIZE,
+				       faasev_shadow_crypto_iv);
+		aead_request_set_ad(faasev_shadow_crypto_req, 0);
+
+		ret = crypto_wait_req(crypto_aead_encrypt(faasev_shadow_crypto_req),
+				      &wait);
+		if (ret)
+			goto out_unlock;
+
+		acc ^= ((u64)faasev_shadow_crypto_buffer[512] << 0) |
+		       ((u64)faasev_shadow_crypto_buffer[513] << 8) |
+		       ((u64)faasev_shadow_crypto_buffer[514] << 16) |
+		       ((u64)faasev_shadow_crypto_buffer[515] << 24) |
+		       ((u64)faasev_shadow_crypto_buffer[516] << 32) |
+		       ((u64)faasev_shadow_crypto_buffer[517] << 40) |
+		       ((u64)faasev_shadow_crypto_buffer[518] << 48) |
+		       ((u64)faasev_shadow_crypto_buffer[519] << 56);
 	}
 
 	barrier_data(&acc);
+
+out_unlock:
+	mutex_unlock(&faasev_shadow_crypto_lock);
+	return ret;
 }
 
 static int faasev_vmpl0_service_crypto_sim(unsigned int operation,
@@ -910,7 +994,7 @@ static int faasev_vmpl0_service_crypto_sim(unsigned int operation,
 	}
 
 	svc = (struct faasev_vmpl0_service_page *)data->faasev_service_page;
-	memset(svc, 0, sizeof(*svc));
+	memset(svc, 0, FAASEV_VMPL0_SERVICE_CRYPTO_SIM_CLEAR_LEN);
 	svc->hdr.magic = FAASEV_VMPL0_SERVICE_MAGIC;
 	svc->hdr.version = FAASEV_VMPL0_SERVICE_VERSION;
 	svc->hdr.header_len = FAASEV_VMPL0_SERVICE_HEADER_LEN;
@@ -923,7 +1007,8 @@ static int faasev_vmpl0_service_crypto_sim(unsigned int operation,
 	svc->crypto_sim.operation = operation;
 	svc->crypto_sim.flags = 0;
 
-	ret = faasev_vmpl0_service_call_locked(svc);
+	ret = faasev_vmpl0_service_call_locked(svc,
+					       FAASEV_VMPL0_SERVICE_CRYPTO_SIM_CLEAR_LEN);
 
 out_unlock:
 	local_irq_restore(flags);

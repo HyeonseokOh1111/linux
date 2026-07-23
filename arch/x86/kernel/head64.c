@@ -48,11 +48,29 @@
 		     "pushq %%rax\n\t"						\
 		     "pushq %%rcx\n\t"						\
 		     "pushq %%rdx\n\t"						\
+		     "pushq %%r8\n\t"						\
+		     "pushq %%r9\n\t"						\
 		     "movl %0, %%ecx\n\t"					\
+		     "rdmsr\n\t"						\
+		     "movq %%rax, %%r8\n\t"					\
+		     "movq %%rdx, %%r9\n\t"					\
 		     "movl $0x14, %%eax\n\t"					\
 		     "movl %1, %%edx\n\t"					\
 		     "wrmsr\n\t"						\
 		     "rep; vmmcall\n\t"						\
+		     "movl %0, %%ecx\n\t"					\
+		     "testl $0xfff, %%r8d\n\t"					\
+		     "jnz 1f\n\t"						\
+		     "movq %%r8, %%rax\n\t"					\
+		     "movq %%r9, %%rdx\n\t"					\
+		     "jmp 2f\n\t"						\
+		     "1:\n\t"							\
+		     "xorl %%eax, %%eax\n\t"					\
+		     "xorl %%edx, %%edx\n\t"					\
+		     "2:\n\t"							\
+		     "wrmsr\n\t"						\
+		     "popq %%r9\n\t"						\
+		     "popq %%r8\n\t"						\
 		     "popq %%rdx\n\t"						\
 		     "popq %%rcx\n\t"						\
 		     "popq %%rax\n\t"						\

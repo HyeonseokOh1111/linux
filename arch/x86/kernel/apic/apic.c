@@ -559,6 +559,16 @@ static struct clock_event_device lapic_clockevent = {
 };
 static DEFINE_PER_CPU(struct clock_event_device, lapic_events);
 
+extern void tick_handle_periodic(struct clock_event_device *dev);
+
+void sev_snapshot_lapic_timer_restore_periodic_handler(void)
+{
+	struct clock_event_device *levt = this_cpu_ptr(&lapic_events);
+
+	levt->features &= ~CLOCK_EVT_FEAT_DUMMY;
+	levt->event_handler = tick_handle_periodic;
+}
+
 static const struct x86_cpu_id deadline_match[] __initconst = {
 	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(HASWELL_X, X86_STEPPINGS(0x2, 0x2), 0x3a), /* EP */
 	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(HASWELL_X, X86_STEPPINGS(0x4, 0x4), 0x0f), /* EX */
