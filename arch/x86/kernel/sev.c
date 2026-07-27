@@ -90,7 +90,6 @@ static bool faasev_vmpl_boot;
 #define FAASEV_VMPL0_SERVICE_VERSION	1
 #define FAASEV_VMPL0_SERVICE_HEADER_LEN	24
 #define FAASEV_VMPL0_SERVICE_OP_PVALIDATE	1
-#define FAASEV_VMPL0_SERVICE_OP_CRYPTO_SIM	2
 #define FAASEV_VMPL0_SERVICE_STATUS_PENDING	1
 #define FAASEV_VMPL0_SERVICE_STATUS_OK		2
 #define FAASEV_VMPL0_SERVICE_PVALIDATE_VALIDATE	BIT(0)
@@ -100,9 +99,6 @@ static bool faasev_vmpl_boot;
 #define FAASEV_SHADOW_CRYPTO_KEY_LEN		16
 #define FAASEV_SHADOW_CRYPTO_BUFFER_LEN		\
 	(FAASEV_SHADOW_CRYPTO_RECORD_SIZE + FAASEV_SHADOW_CRYPTO_TAG_LEN)
-#define FAASEV_VMPL0_SERVICE_CRYPTO_SIM_CLEAR_LEN	\
-	(FAASEV_VMPL0_SERVICE_HEADER_LEN +		\
-	 sizeof(struct faasev_vmpl0_service_crypto_sim))
 
 struct faasev_vmpl0_service_header {
 	u32 magic;
@@ -119,30 +115,16 @@ struct faasev_vmpl0_service_pvalidate {
 	u32 flags;
 } __packed;
 
-struct faasev_vmpl0_service_crypto_sim {
-	u64 ciphertext_gpa;
-	u64 plaintext_gpa;
-	u64 len;
-	u32 operation;
-	u32 flags;
-	u64 accumulator;
-} __packed;
-
 struct faasev_vmpl0_service_page {
 	struct faasev_vmpl0_service_header hdr;
-	union {
-		struct faasev_vmpl0_service_pvalidate pvalidate;
-		struct faasev_vmpl0_service_crypto_sim crypto_sim;
-	};
+	struct faasev_vmpl0_service_pvalidate pvalidate;
 	u8 reserved[PAGE_SIZE - FAASEV_VMPL0_SERVICE_HEADER_LEN -
-		    sizeof(struct faasev_vmpl0_service_crypto_sim)];
+		    sizeof(struct faasev_vmpl0_service_pvalidate)];
 } __packed;
 
 static int faasev_vmpl0_service_pvalidate_pages(unsigned long vaddr,
 						unsigned int npages,
 						bool validate);
-static int faasev_vmpl0_service_crypto_sim(unsigned int operation,
-					   size_t payload_len);
 static int faasev_shadow_crypto_local_sim(unsigned int operation,
 					  size_t payload_len);
 
@@ -167,9 +149,6 @@ SYSCALL_DEFINE2(faasev_shadow_crypto, unsigned int, operation,
 	if (!payload_len)
 		return 0;
 
-	if (faasev_vmpl_boot)
-		return faasev_vmpl0_service_crypto_sim(operation, payload_len);
-
 	return faasev_shadow_crypto_local_sim(operation, payload_len);
 }
 
@@ -181,8 +160,8 @@ struct sev_es_runtime_data {
 	 * Private VMPL1<->VMPL0 service page.  VMPL1 notifies VMPL0 through
 	 * a GHCB page-protocol VMGEXIT that carries only a FaaSEV service
 	 * exit code.
-	 * PVALIDATE target GPAs and crypto-simulation GPAs/lengths stay in
-	 * this encrypted page and are consumed only by VMPL0.
+	 * PVALIDATE target GPAs stay in this encrypted page and are consumed
+	 * only by VMPL0.
 	 */
 	u8 faasev_service_page[PAGE_SIZE] __aligned(PAGE_SIZE);
 
@@ -973,46 +952,6 @@ static int faasev_shadow_crypto_local_sim(unsigned int operation,
 
 out_unlock:
 	mutex_unlock(&faasev_shadow_crypto_lock);
-	return ret;
-}
-
-static int faasev_vmpl0_service_crypto_sim(unsigned int operation,
-					   size_t payload_len)
-{
-	struct faasev_vmpl0_service_page *svc;
-	struct sev_es_runtime_data *data;
-	unsigned long flags;
-	int ret;
-
-	preempt_disable();
-	local_irq_save(flags);
-
-	data = this_cpu_read(runtime_data);
-	if (!data) {
-		ret = -ENODEV;
-		goto out_unlock;
-	}
-
-	svc = (struct faasev_vmpl0_service_page *)data->faasev_service_page;
-	memset(svc, 0, FAASEV_VMPL0_SERVICE_CRYPTO_SIM_CLEAR_LEN);
-	svc->hdr.magic = FAASEV_VMPL0_SERVICE_MAGIC;
-	svc->hdr.version = FAASEV_VMPL0_SERVICE_VERSION;
-	svc->hdr.header_len = FAASEV_VMPL0_SERVICE_HEADER_LEN;
-	svc->hdr.opcode = FAASEV_VMPL0_SERVICE_OP_CRYPTO_SIM;
-	svc->hdr.status = FAASEV_VMPL0_SERVICE_STATUS_PENDING;
-	svc->hdr.seq = ++data->faasev_service_seq;
-	svc->crypto_sim.ciphertext_gpa = 0;
-	svc->crypto_sim.plaintext_gpa = 0;
-	svc->crypto_sim.len = payload_len;
-	svc->crypto_sim.operation = operation;
-	svc->crypto_sim.flags = 0;
-
-	ret = faasev_vmpl0_service_call_locked(svc,
-					       FAASEV_VMPL0_SERVICE_CRYPTO_SIM_CLEAR_LEN);
-
-out_unlock:
-	local_irq_restore(flags);
-	preempt_enable();
 	return ret;
 }
 
