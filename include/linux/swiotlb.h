@@ -114,6 +114,8 @@ struct io_tlb_mem {
 };
 extern struct io_tlb_mem io_tlb_default_mem;
 
+bool swiotlb_is_hugepage_range(phys_addr_t paddr, size_t size);
+
 static inline bool is_swiotlb_buffer(struct device *dev, phys_addr_t paddr)
 {
 	struct io_tlb_mem *mem = dev->dma_io_tlb_mem;
@@ -154,6 +156,11 @@ static inline size_t swiotlb_max_mapping_size(struct device *dev)
 }
 
 static inline bool is_swiotlb_active(struct device *dev)
+{
+	return false;
+}
+
+static inline bool swiotlb_is_hugepage_range(phys_addr_t paddr, size_t size)
 {
 	return false;
 }

@@ -32,11 +32,13 @@
 #include <linux/io.h>
 #include <linux/iommu-helper.h>
 #include <linux/init.h>
+#include <linux/kernel.h>
 #include <linux/memblock.h>
 #include <linux/mm.h>
 #include <linux/pfn.h>
 #include <linux/scatterlist.h>
 #include <linux/set_memory.h>
+#include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/swiotlb.h>
@@ -70,6 +72,7 @@ struct io_tlb_slot {
 
 static bool swiotlb_force_bounce;
 static bool swiotlb_force_disable;
+static bool swiotlb_hugepages;
 
 struct io_tlb_mem io_tlb_default_mem;
 
@@ -154,9 +157,30 @@ setup_io_tlb_npages(char *str)
 }
 early_param("swiotlb", setup_io_tlb_npages);
 
+static int __init setup_swiotlb_hugepages(char *str)
+{
+	if (!str)
+		return -EINVAL;
+
+	return kstrtobool(str, &swiotlb_hugepages);
+}
+early_param("swiotlb_hugepages", setup_swiotlb_hugepages);
+
 unsigned long swiotlb_size_or_default(void)
 {
 	return default_nslabs << IO_TLB_SHIFT;
+}
+
+bool swiotlb_is_hugepage_range(phys_addr_t paddr, size_t size)
+{
+	struct io_tlb_mem *mem = &io_tlb_default_mem;
+
+	if (!swiotlb_hugepages || mem->late_alloc || !IS_ALIGNED(paddr, SZ_2M))
+		return false;
+	if (paddr < mem->start || paddr >= mem->end)
+		return false;
+
+	return size >= SZ_2M && size <= mem->end - paddr;
 }
 
 void __init swiotlb_adjust_size(unsigned long size)
@@ -254,6 +278,7 @@ static void __init *swiotlb_memblock_alloc(unsigned long nslabs,
 		int (*remap)(void *tlb, unsigned long nslabs))
 {
 	size_t bytes = PAGE_ALIGN(nslabs << IO_TLB_SHIFT);
+	phys_addr_t alignment = swiotlb_hugepages ? SZ_2M : PAGE_SIZE;
 	void *tlb;
 
 	/*
@@ -262,9 +287,9 @@ static void __init *swiotlb_memblock_alloc(unsigned long nslabs,
 	 * memory encryption.
 	 */
 	if (flags & SWIOTLB_ANY)
-		tlb = memblock_alloc(bytes, PAGE_SIZE);
+		tlb = memblock_alloc(bytes, alignment);
 	else
-		tlb = memblock_alloc_low(bytes, PAGE_SIZE);
+		tlb = memblock_alloc_low(bytes, alignment);
 
 	if (!tlb) {
 		pr_warn("%s: Failed to allocate %zu bytes tlb structure\n",
