@@ -621,6 +621,77 @@ __irqentry_text_start:
 __irqentry_text_end:
 	ANNOTATE_NOENDBR
 
+SYM_CODE_START(sev_snapshot_sysret_from_ptregs)
+	UNWIND_HINT_REGS
+
+	IBRS_EXIT
+	POP_REGS pop_rdi=0
+
+	/*
+	 * Snapshot resumes a syscall-exit frame.  Mirror the native SYSRET
+	 * fast path: switch away from the pt_regs stack, restore user CR3 from
+	 * the trampoline stack, then SYSRET.  Reload RCX/R11 from the remaining
+	 * IRET frame so the restore contract depends on RIP/EFLAGS, not on the
+	 * duplicated syscall scratch-register slots.
+	 */
+	movq	2*8(%rsp), %rcx	/* user RIP */
+	movq	4*8(%rsp), %r11	/* user RFLAGS */
+	movq	%rsp, %rdi
+	movq	sev_snapshot_restore_user_return_sp0(%rip), %rsp
+	testq	%rsp, %rsp
+	jnz	1f
+	ud2
+1:
+	UNWIND_HINT_END_OF_STACK
+
+	pushq	RSP-RDI(%rdi)	/* user RSP */
+	pushq	(%rdi)		/* user RDI */
+
+	STACKLEAK_ERASE_NOCLOBBER
+
+	SWITCH_TO_USER_CR3_STACK scratch_reg=%rdi
+
+	popq	%rdi
+	popq	%rsp
+	swapgs
+	sysretq
+SYM_CODE_END(sev_snapshot_sysret_from_ptregs)
+
+SYM_CODE_START(sev_snapshot_iret_from_ptregs)
+	UNWIND_HINT_REGS
+
+	IBRS_EXIT
+	POP_REGS pop_rdi=0
+
+	/*
+	 * The stack is now user RDI, orig_ax, RIP, CS, EFLAGS, RSP, SS.
+	 * Copy the IRET frame to the restored trampoline stack before
+	 * switching to user CR3, matching the native slow return path.
+	 */
+	movq	%rsp, %rdi
+	movq	sev_snapshot_restore_user_return_sp0(%rip), %rsp
+	testq	%rsp, %rsp
+	jnz	1f
+	ud2
+1:
+	UNWIND_HINT_END_OF_STACK
+
+	pushq	6*8(%rdi)	/* SS */
+	pushq	5*8(%rdi)	/* RSP */
+	pushq	4*8(%rdi)	/* EFLAGS */
+	pushq	3*8(%rdi)	/* CS */
+	pushq	2*8(%rdi)	/* RIP */
+	pushq	(%rdi)		/* user RDI */
+
+	STACKLEAK_ERASE_NOCLOBBER
+
+	SWITCH_TO_USER_CR3_STACK scratch_reg=%rdi
+
+	popq	%rdi
+	swapgs
+	jmp	.Lnative_iret
+SYM_CODE_END(sev_snapshot_iret_from_ptregs)
+
 SYM_CODE_START_LOCAL(common_interrupt_return)
 SYM_INNER_LABEL(swapgs_restore_regs_and_return_to_usermode, SYM_L_GLOBAL)
 	IBRS_EXIT

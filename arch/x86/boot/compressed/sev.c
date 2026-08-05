@@ -128,18 +128,6 @@ static inline bool sev_snp_enabled(void)
 	return sev_status & MSR_AMD64_SEV_SNP_ENABLED;
 }
 
-static bool faasev_vmpl_requested(void)
-{
-	char arg[4];
-	int len;
-
-	len = cmdline_find_option("faasev_vmpl", arg, sizeof(arg));
-	if (len < 0)
-		return false;
-
-	return len == 0 || arg[0] == '1';
-}
-
 static void __page_state_change(unsigned long paddr, enum psc_op op)
 {
 	u64 val;
@@ -147,14 +135,6 @@ static void __page_state_change(unsigned long paddr, enum psc_op op)
 	if (!sev_snp_enabled())
 		return;
 
-	/*
-	 * In the VMPL path, VMPL0 owns private-page acceptance and lower-VMPL
-	 * permission grants. A compressed-boot private PSC from VMPL1 can clear
-	 * those grants before the main kernel can install VMPL0-mediated page
-	 * state tracking.
-	 */
-	if (op == SNP_PAGE_STATE_PRIVATE && faasev_vmpl_requested())
-		return;
 
 	/*
 	 * If private -> shared then invalidate the page before requesting the

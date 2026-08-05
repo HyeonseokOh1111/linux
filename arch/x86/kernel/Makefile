@@ -18,10 +18,13 @@ CFLAGS_REMOVE_early_printk.o = -pg
 CFLAGS_REMOVE_head64.o = -pg
 CFLAGS_REMOVE_sev.o = -pg
 CFLAGS_REMOVE_sev_snapshot.o = -pg
+CFLAGS_REMOVE_sev_snapshot_entry_64.o = -pg
 CFLAGS_REMOVE_rethook.o = -pg
 endif
 
 CFLAGS_sev_snapshot.o += -fno-stack-protector
+
+OBJECT_FILES_NON_STANDARD_sev_snapshot_entry_64.o := y
 
 KASAN_SANITIZE_head$(BITS).o				:= n
 KASAN_SANITIZE_dumpstack.o				:= n
@@ -30,6 +33,7 @@ KASAN_SANITIZE_stacktrace.o				:= n
 KASAN_SANITIZE_paravirt.o				:= n
 KASAN_SANITIZE_sev.o					:= n
 KASAN_SANITIZE_sev_snapshot.o				:= n
+KASAN_SANITIZE_sev_snapshot_entry_64.o			:= n
 
 # With some compiler versions the generated code results in boot hangs, caused
 # by several compilation units. To be safe, disable all instrumentation.
@@ -143,7 +147,7 @@ obj-$(CONFIG_UNWINDER_ORC)		+= unwind_orc.o
 obj-$(CONFIG_UNWINDER_FRAME_POINTER)	+= unwind_frame.o
 obj-$(CONFIG_UNWINDER_GUESS)		+= unwind_guess.o
 
-obj-$(CONFIG_AMD_MEM_ENCRYPT)		+= sev.o sev_snapshot.o
+obj-$(CONFIG_AMD_MEM_ENCRYPT)		+= sev.o sev_snapshot.o sev_snapshot_entry_64.o
 
 obj-$(CONFIG_CFI_CLANG)			+= cfi.o
 

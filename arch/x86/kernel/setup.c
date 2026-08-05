@@ -57,24 +57,6 @@
 #include <asm/vsyscall.h>
 #include <linux/vmalloc.h>
 
-#define FAASEV_SETUP_ARCH_DEBUG(code)					\
-	asm volatile("pushfq\n\t"					\
-		     "pushq %%rax\n\t"					\
-		     "pushq %%rcx\n\t"					\
-		     "pushq %%rdx\n\t"					\
-		     "movl $0xc0010130, %%ecx\n\t"			\
-		     "movl $0x14, %%eax\n\t"				\
-		     "movl %0, %%edx\n\t"				\
-		     "wrmsr\n\t"					\
-		     "rep; vmmcall\n\t"					\
-		     "popq %%rdx\n\t"					\
-		     "popq %%rcx\n\t"					\
-		     "popq %%rax\n\t"					\
-		     "popfq\n\t"					\
-		     :							\
-		     : "i"((code) << 16)				\
-		     : "memory")
-
 /*
  * max_low_pfn_mapped: highest directly mapped pfn < 4 GB
  * max_pfn_mapped:     highest directly mapped pfn > 4 GB
@@ -789,7 +771,6 @@ static void __init e820_add_kernel_range(void)
 
 static void __init early_reserve_memory(void)
 {
-	FAASEV_SETUP_ARCH_DEBUG(0xc6);
 	/*
 	 * Reserve the memory occupied by the kernel between _text and
 	 * __end_of_kernel_reserve symbols. Any kernel sections after the
@@ -798,7 +779,6 @@ static void __init early_reserve_memory(void)
 	 */
 	memblock_reserve(__pa_symbol(_text),
 			 (unsigned long)__end_of_kernel_reserve - (unsigned long)_text);
-	FAASEV_SETUP_ARCH_DEBUG(0xc7);
 
 	/*
 	 * The first 4Kb of memory is a BIOS owned area, but generally it is
@@ -812,21 +792,15 @@ static void __init early_reserve_memory(void)
 	 * systems with L1TF its contents can be leaked to user processes.
 	 */
 	memblock_reserve(0, SZ_64K);
-	FAASEV_SETUP_ARCH_DEBUG(0xc8);
 
 	early_reserve_initrd();
-	FAASEV_SETUP_ARCH_DEBUG(0xc9);
 
 	memblock_x86_reserve_range_setup_data();
-	FAASEV_SETUP_ARCH_DEBUG(0xca);
-	FAASEV_SETUP_ARCH_DEBUG(0xcb);
+	sev_mailbox_reserve_from_setup_data(&boot_params);
 
 	reserve_ibft_region();
-	FAASEV_SETUP_ARCH_DEBUG(0xcc);
 	reserve_bios_regions();
-	FAASEV_SETUP_ARCH_DEBUG(0xcd);
 	trim_snb_memory();
-	FAASEV_SETUP_ARCH_DEBUG(0xce);
 }
 
 /*
@@ -887,7 +861,6 @@ static void __init x86_report_nx(void)
 
 void __init setup_arch(char **cmdline_p)
 {
-	FAASEV_SETUP_ARCH_DEBUG(0x99);
 #ifdef CONFIG_X86_32
 	memcpy(&boot_cpu_data, &new_cpu_data, sizeof(new_cpu_data));
 
@@ -926,10 +899,8 @@ void __init setup_arch(char **cmdline_p)
 	jump_label_init();
 	static_call_init();
 	early_ioremap_init();
-	FAASEV_SETUP_ARCH_DEBUG(0x9a);
 
 	setup_olpc_ofw_pgd();
-	FAASEV_SETUP_ARCH_DEBUG(0xb7);
 
 	ROOT_DEV = old_decode_dev(boot_params.hdr.root_dev);
 	screen_info = boot_params.screen_info;
@@ -950,7 +921,6 @@ void __init setup_arch(char **cmdline_p)
 #ifdef CONFIG_BLK_DEV_RAM
 	rd_image_start = boot_params.hdr.ram_size & RAMDISK_IMAGE_START_MASK;
 #endif
-	FAASEV_SETUP_ARCH_DEBUG(0xc1);
 #ifdef CONFIG_EFI
 	if (!strncmp((char *)&boot_params.efi_info.efi_loader_signature,
 		     EFI32_LOADER_SIGNATURE, 4)) {
@@ -963,7 +933,6 @@ void __init setup_arch(char **cmdline_p)
 #endif
 
 	x86_init.oem.arch_setup();
-	FAASEV_SETUP_ARCH_DEBUG(0xc2);
 
 	/*
 	 * Do some memory reservations *before* memory is added to memblock, so
@@ -978,13 +947,10 @@ void __init setup_arch(char **cmdline_p)
 	 * early reservations have happened already.
 	 */
 	early_reserve_memory();
-	FAASEV_SETUP_ARCH_DEBUG(0xc3);
 
 	iomem_resource.end = (1ULL << boot_cpu_data.x86_phys_bits) - 1;
 	e820__memory_setup();
-	FAASEV_SETUP_ARCH_DEBUG(0xc4);
 	parse_setup_data();
-	FAASEV_SETUP_ARCH_DEBUG(0x9b);
 
 	copy_edd();
 
@@ -1025,7 +991,6 @@ void __init setup_arch(char **cmdline_p)
 	x86_configure_nx();
 
 	parse_early_param();
-	FAASEV_SETUP_ARCH_DEBUG(0x9c);
 
 	if (efi_enabled(EFI_BOOT))
 		efi_memblock_x86_reserve_range();
@@ -1079,7 +1044,6 @@ void __init setup_arch(char **cmdline_p)
 
 	tsc_early_init();
 	x86_init.resources.probe_roms();
-	FAASEV_SETUP_ARCH_DEBUG(0x9d);
 
 	/* after parse_early_param, so could debug it */
 	insert_resource(&iomem_resource, &code_resource);
@@ -1119,7 +1083,6 @@ void __init setup_arch(char **cmdline_p)
 	 * defined and before each memory section base is used.
 	 */
 	kernel_randomize_memory();
-	FAASEV_SETUP_ARCH_DEBUG(0x9e);
 
 #ifdef CONFIG_X86_32
 	/* max_low_pfn get updated here */
@@ -1155,15 +1118,12 @@ void __init setup_arch(char **cmdline_p)
 
 	memblock_set_current_limit(ISA_END_ADDRESS);
 	e820__memblock_setup();
-	FAASEV_SETUP_ARCH_DEBUG(0x9f);
 
 	/*
 	 * Needs to run after memblock setup because it needs the physical
 	 * memory size.
 	 */
-	FAASEV_SETUP_ARCH_DEBUG(0xa8);
 	sev_setup_arch();
-	FAASEV_SETUP_ARCH_DEBUG(0xa9);
 
 	efi_fake_memmap();
 	efi_find_mirror();
@@ -1178,7 +1138,6 @@ void __init setup_arch(char **cmdline_p)
 
 	/* preallocate 4k for mptable mpc */
 	e820__memblock_alloc_reserved_mpc_new();
-	FAASEV_SETUP_ARCH_DEBUG(0xaa);
 
 #ifdef CONFIG_X86_CHECK_BIOS_CORRUPTION
 	setup_bios_corruption_check();
@@ -1204,12 +1163,10 @@ void __init setup_arch(char **cmdline_p)
 	 * crashkernel the entire 1M is reserved anyway.
 	 */
 	x86_platform.realmode_reserve();
-	FAASEV_SETUP_ARCH_DEBUG(0xab);
 
 	init_mem_mapping();
 
 	idt_setup_early_pf();
-	FAASEV_SETUP_ARCH_DEBUG(0xac);
 
 	/*
 	 * Update mmu_cr4_features (and, indirectly, trampoline_cr4_features)
@@ -1279,7 +1236,6 @@ void __init setup_arch(char **cmdline_p)
 
 	if (!early_xdbc_setup_hardware())
 		early_xdbc_register_console();
-	FAASEV_SETUP_ARCH_DEBUG(0xad);
 
 	x86_init.paging.pagetable_init();
 

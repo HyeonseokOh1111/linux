@@ -26,42 +26,6 @@
 #include <asm/nospec-branch.h>
 #include <asm/fixmap.h>
 
-.macro FAASEV_GHCB_DEBUG code
-#ifdef CONFIG_AMD_MEM_ENCRYPT
-	pushfq
-	pushq	%rax
-	pushq	%rcx
-	pushq	%rdx
-	pushq	%r8
-	pushq	%r9
-	movl	$MSR_AMD64_SEV_ES_GHCB, %ecx
-	rdmsr
-	movq	%rax, %r8
-	movq	%rdx, %r9
-	movl	$0x14, %eax
-	movl	$(\code << 16), %edx
-	wrmsr
-	rep; vmmcall
-	movl	$MSR_AMD64_SEV_ES_GHCB, %ecx
-	testl	$0xfff, %r8d
-	jnz	1f
-	movq	%r8, %rax
-	movq	%r9, %rdx
-	jmp	2f
-1:
-	xorl	%eax, %eax
-	xorl	%edx, %edx
-2:
-	wrmsr
-	popq	%r9
-	popq	%r8
-	popq	%rdx
-	popq	%rcx
-	popq	%rax
-	popfq
-#endif
-.endm
-
 /*
  * We are not able to switch in one step to the final KERNEL ADDRESS SPACE
  * because we need identity-mapped pages.
@@ -100,8 +64,6 @@ SYM_CODE_START_NOALIGN(startup_64)
 	/* Set up the stack for verify_cpu() */
 	leaq	(__end_init_task - PTREGS_SIZE)(%rip), %rsp
 
-	FAASEV_GHCB_DEBUG 0xd0
-
 	leaq	_text(%rip), %rdi
 
 	/* Setup GSBASE to allow stack canary access for C code */
@@ -114,8 +76,6 @@ SYM_CODE_START_NOALIGN(startup_64)
 	pushq	%rsi
 	call	startup_64_setup_env
 	popq	%rsi
-
-	FAASEV_GHCB_DEBUG 0xd1
 
 	/* Now switch to __KERNEL_CS so IRET works reliably */
 	pushq	$__KERNEL_CS
@@ -134,17 +94,13 @@ SYM_CODE_START_NOALIGN(startup_64)
 	 * subsequent code.
 	 */
 	movq	%rsi, %rdi
-	FAASEV_GHCB_DEBUG 0xd2
 	pushq	%rsi
 	call	sme_enable
 	popq	%rsi
-	FAASEV_GHCB_DEBUG 0xd3
 #endif
 
 	/* Sanitize CPU configuration */
-	FAASEV_GHCB_DEBUG 0xd4
 	call verify_cpu
-	FAASEV_GHCB_DEBUG 0xd5
 
 	/*
 	 * Perform pagetable fixups. Additionally, if SME is active, encrypt
@@ -153,11 +109,9 @@ SYM_CODE_START_NOALIGN(startup_64)
 	 * programmed into CR3.
 	 */
 	leaq	_text(%rip), %rdi
-	FAASEV_GHCB_DEBUG 0xd6
 	pushq	%rsi
 	call	__startup_64
 	popq	%rsi
-	FAASEV_GHCB_DEBUG 0xd7
 
 	/* Form the CR3 value being sure to include the CR3 modifier */
 	addq	$(early_top_pgt - __START_KERNEL_map), %rax
@@ -237,7 +191,6 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
 
 	/* Setup early boot stage 4-/5-level pagetables. */
 	addq	phys_base(%rip), %rax
-	FAASEV_GHCB_DEBUG 0xd8
 
 	/*
 	 * For SEV guests: Verify that the C-bit is correct. A malicious
@@ -251,7 +204,6 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
 	movq	%rax, %rdi
 	call	sev_verify_cbit
 	popq	%rsi
-	FAASEV_GHCB_DEBUG 0xd9
 
 	/*
 	 * Switch to new page-table
@@ -261,9 +213,7 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
 	 * init_top_pgt here, away from the trampoline_pgd and unmap the
 	 * indentity mapped ranges.
 	 */
-	FAASEV_GHCB_DEBUG 0xda
 	movq	%rax, %cr3
-	FAASEV_GHCB_DEBUG 0xdb
 
 	/*
 	 * Do a global TLB flush after the CR3 switch to make sure the TLB
@@ -274,7 +224,6 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
 	xorq	$X86_CR4_PGE, %rcx
 	movq	%rcx, %cr4
 	movq	%rax, %cr4
-	FAASEV_GHCB_DEBUG 0xdc
 
 	/* Ensure I am executing from virtual addresses */
 	movq	$1f, %rax
@@ -283,7 +232,6 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
 1:
 	UNWIND_HINT_END_OF_STACK
 	ANNOTATE_NOENDBR // above
-	FAASEV_GHCB_DEBUG 0xdd
 
 #ifdef CONFIG_SMP
 	movl	smpboot_control(%rip), %ecx
@@ -315,7 +263,6 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
 	movq	%rax, 2(%rsp)
 	lgdt	(%rsp)
 	addq	$16, %rsp
-	FAASEV_GHCB_DEBUG 0xde
 
 	/* set up data segments */
 	xorl %eax,%eax
@@ -350,7 +297,6 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
 	pushq	%rsi
 	call	early_setup_idt
 	popq	%rsi
-	FAASEV_GHCB_DEBUG 0xdf
 
 	/* Check if nx is implemented */
 	movl	$0x80000001, %eax
@@ -421,7 +367,6 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
 	movq	initial_code(%rip), %rax
 	pushq	$__KERNEL_CS	# set correct cs
 	pushq	%rax		# target address in negative space
-	FAASEV_GHCB_DEBUG 0xe7
 	lretq
 .Lafter_lret:
 	ANNOTATE_NOENDBR
