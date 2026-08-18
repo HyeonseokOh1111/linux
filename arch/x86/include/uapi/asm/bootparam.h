@@ -13,8 +13,7 @@
 #define SETUP_CC_BLOB			7
 #define SETUP_IMA			8
 #define SETUP_RNG_SEED			9
-#define SETUP_SEV_SNAPSHOT_MAILBOX	10
-#define SETUP_ENUM_MAX			SETUP_SEV_SNAPSHOT_MAILBOX
+#define SETUP_ENUM_MAX			SETUP_RNG_SEED
 
 #define SETUP_INDIRECT			(1<<31)
 #define SETUP_TYPE_MAX			(SETUP_ENUM_MAX | SETUP_INDIRECT)
@@ -179,11 +178,6 @@ struct jailhouse_setup_data {
  */
 struct ima_setup_data {
 	__u64 addr;
-	__u64 size;
-} __attribute__((packed));
-
-struct sev_snapshot_mailbox_desc {
-	__u64 phys_addr;
 	__u64 size;
 } __attribute__((packed));
 

@@ -53,9 +53,47 @@
 #define BIOS_START_MIN		0x20000U	/* 128K, less than this is insane */
 #define BIOS_START_MAX		0x9f000U	/* 640K, absolute maximum */
 
+#define FAASEV_EBDA_DEBUG(code)						\
+	asm volatile("pushfq\n\t"					\
+		     "pushq %%rax\n\t"					\
+		     "pushq %%rcx\n\t"					\
+		     "pushq %%rdx\n\t"					\
+		     "pushq %%r8\n\t"					\
+		     "pushq %%r9\n\t"					\
+		     "movl $0xc0010130, %%ecx\n\t"			\
+		     "rdmsr\n\t"					\
+		     "movq %%rax, %%r8\n\t"				\
+		     "movq %%rdx, %%r9\n\t"				\
+		     "movl $0x14, %%eax\n\t"				\
+		     "movl %0, %%edx\n\t"				\
+		     "wrmsr\n\t"					\
+		     "rep; vmmcall\n\t"					\
+		     "movl $0xc0010130, %%ecx\n\t"			\
+		     "testl $0xfff, %%r8d\n\t"				\
+		     "jnz 1f\n\t"					\
+		     "movq %%r8, %%rax\n\t"				\
+		     "movq %%r9, %%rdx\n\t"				\
+		     "jmp 2f\n\t"					\
+		     "1:\n\t"						\
+		     "xorl %%eax, %%eax\n\t"				\
+		     "xorl %%edx, %%edx\n\t"				\
+		     "2:\n\t"						\
+		     "wrmsr\n\t"					\
+		     "popq %%r9\n\t"					\
+		     "popq %%r8\n\t"					\
+		     "popq %%rdx\n\t"					\
+		     "popq %%rcx\n\t"					\
+		     "popq %%rax\n\t"					\
+		     "popfq\n\t"					\
+		     :							\
+		     : "i"((code) << 16)				\
+		     : "memory")
+
 void __init reserve_bios_regions(void)
 {
 	unsigned int bios_start, ebda_start;
+
+	FAASEV_EBDA_DEBUG(0x60);
 
 	/*
 	 * NOTE: In a paravirtual environment the BIOS reserved
@@ -65,13 +103,16 @@ void __init reserve_bios_regions(void)
 	 */
 	if (!x86_platform.legacy.reserve_bios_regions)
 		return;
+	FAASEV_EBDA_DEBUG(0x61);
 
 	/*
 	 * BIOS RAM size is encoded in kilobytes, convert it
 	 * to bytes to get a first guess at where the BIOS
 	 * firmware area starts:
 	 */
+	FAASEV_EBDA_DEBUG(0x62);
 	bios_start = *(unsigned short *)__va(BIOS_RAM_SIZE_KB_PTR);
+	FAASEV_EBDA_DEBUG(0x63);
 	bios_start <<= 10;
 
 	/*
@@ -81,9 +122,12 @@ void __init reserve_bios_regions(void)
 	 */
 	if (bios_start < BIOS_START_MIN || bios_start > BIOS_START_MAX)
 		bios_start = BIOS_START_MAX;
+	FAASEV_EBDA_DEBUG(0x64);
 
 	/* Get the start address of the EBDA page: */
+	FAASEV_EBDA_DEBUG(0x65);
 	ebda_start = get_bios_ebda();
+	FAASEV_EBDA_DEBUG(0x66);
 
 	/*
 	 * If the EBDA start address is sane and is below the BIOS region,
@@ -95,4 +139,5 @@ void __init reserve_bios_regions(void)
 
 	/* Reserve all memory between bios_start and the 1MB mark: */
 	memblock_reserve(bios_start, 0x100000 - bios_start);
+	FAASEV_EBDA_DEBUG(0x67);
 }

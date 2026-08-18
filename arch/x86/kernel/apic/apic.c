@@ -73,8 +73,6 @@ EXPORT_SYMBOL_GPL(boot_cpu_physical_apicid);
 
 u8 boot_cpu_apic_version __ro_after_init;
 
-extern bool sev_snapshot_resume_in_progress;
-
 /*
  * The highest APIC ID seen during enumeration.
  */
@@ -560,6 +558,16 @@ static struct clock_event_device lapic_clockevent = {
 	.irq				= -1,
 };
 static DEFINE_PER_CPU(struct clock_event_device, lapic_events);
+
+extern void tick_handle_periodic(struct clock_event_device *dev);
+
+void sev_snapshot_lapic_timer_restore_periodic_handler(void)
+{
+	struct clock_event_device *levt = this_cpu_ptr(&lapic_events);
+
+	levt->features &= ~CLOCK_EVT_FEAT_DUMMY;
+	levt->event_handler = tick_handle_periodic;
+}
 
 static const struct x86_cpu_id deadline_match[] __initconst = {
 	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(HASWELL_X, X86_STEPPINGS(0x2, 0x2), 0x3a), /* EP */
@@ -1110,8 +1118,6 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_apic_timer_interrupt)
 	struct pt_regs *old_regs = set_irq_regs(regs);
 
 	ack_APIC_irq();
-	if (READ_ONCE(sev_snapshot_resume_in_progress))
-		generic_smp_call_function_single_interrupt();
 	trace_local_timer_entry(LOCAL_TIMER_VECTOR);
 	local_apic_timer_interrupt();
 	trace_local_timer_exit(LOCAL_TIMER_VECTOR);

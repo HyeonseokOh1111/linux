@@ -3,9 +3,8 @@
  * AMD SEV-SNP guest-triggered snapshot support.
  *
  * This header is intentionally local to arch/x86/kernel/.  The snapshot
- * mailbox/control layouts are part of the host/guest contract used by
- * the x86 snapshot path, but the implementation itself stays private to the
- * x86 SEV code.
+ * syscall is now a VMPL/VMSA handoff trigger; Linux no longer publishes a
+ * restore descriptor or CPU-state mailbox.
  */
 
 #ifndef __ARCH_X86_KERNEL_SEV_SNAPSHOT_H
@@ -14,9 +13,6 @@
 #include <linux/types.h>
 
 #include <asm/bootparam.h>
-#include <asm/desc_defs.h>
-#include <asm/ptrace.h>
-#include <asm/segment.h>
 #include <asm/sev-common.h>
 
 struct sev_snapshot_shared_extent {
@@ -24,118 +20,7 @@ struct sev_snapshot_shared_extent {
 	u64 npages;
 };
 
-struct sev_snapshot_cpu_context {
-	u32 context_size;
-	u32 valid_flags;
-	struct pt_regs regs;
-	u64 kernel_regs_ptr;
-	u64 restore_stub_rip;
-	u64 restore_mailbox_va;
-	u16 ds;
-	u16 es;
-	u16 fs;
-	u16 gs;
-	u16 ldt;
-	u16 tss;
-	u64 fs_base;
-	u64 kernel_gs_base;
-	u64 user_gs_base;
-	u64 cr0;
-	u64 cr2;
-	u64 cr3;
-	u64 cr4;
-	u64 efer;
-	struct desc_ptr gdt_desc;
-	struct desc_ptr idt;
-	u64 tr;
-	u64 xcr0;
-	u64 xstate_bv;
-	u32 xsave_len;
-	u32 xsave_max_size;
-	u32 pkru;
-	u8 gdt_copy[GDT_SIZE];
-	u8 xsave[PAGE_SIZE];
-	u64 restore_gdt_page_va;
-	u64 restore_gdt_page_pa;
-	u64 restore_from_mailbox_rip;
-	u64 hardirq_stack_ptr;
-};
-
-struct sev_snapshot_mailbox {
-	struct sev_snapshot_cpu_context cpu_ctx;
-	u32 shared_extent_count;
-	u32 reserved;
-	struct sev_snapshot_shared_extent shared_extents[];
-};
-
-#define SEV_SNAPSHOT_MAILBOX_V2_MAGIC		0x32565353U /* "SSV2" */
-#define SEV_SNAPSHOT_MAILBOX_V2_VERSION		1U
-#define SEV_SNAPSHOT_RESTORE_MODE_SINGLE_VCPU	0U
-#define SEV_SNAPSHOT_RESTORE_MODE_MULTI_VCPU	1U
 #define SEV_SNAPSHOT_V2_MIN_CPUS		1U
-#define SEV_SNAPSHOT_V2_MAX_CPUS		64U
-
-struct sev_snapshot_mailbox_v2_header {
-	u32 magic;
-	u16 version;
-	u16 header_size;
-	u32 mode;
-	u32 cpu_count;
-	u32 cpu_bundle_len;
-	u32 flags;
-	u32 reserved;
-};
-
-struct sev_snapshot_cpu_topology {
-	u32 linux_cpu_id;
-	u32 apic_id;
-	u32 vcpu_index;
-	u32 reserved;
-};
-
-struct sev_snapshot_restore_barrier {
-	u32 ready;
-	u32 ap_continue;
-	u32 ap_continue_ready;
-	u32 virtio_done;
-	u32 resume_ready;
-	u32 reserved[3];
-};
-
-struct sev_snapshot_mailbox_v2 {
-	struct sev_snapshot_mailbox_v2_header header;
-	u8 payload[];
-};
-
-#define SEV_SNAPSHOT_CPU_CTX_F_SEGS		BIT(0)
-#define SEV_SNAPSHOT_CPU_CTX_F_BASES		BIT(1)
-#define SEV_SNAPSHOT_CPU_CTX_F_CONTROL		BIT(2)
-#define SEV_SNAPSHOT_CPU_CTX_F_EFER		BIT(3)
-#define SEV_SNAPSHOT_CPU_CTX_F_TABLES		BIT(4)
-#define SEV_SNAPSHOT_CPU_CTX_F_TR		BIT(5)
-#define SEV_SNAPSHOT_CPU_CTX_F_XSAVE_META	BIT(6)
-#define SEV_SNAPSHOT_CPU_CTX_F_XSAVE_DATA	BIT(7)
-#define SEV_SNAPSHOT_CPU_CTX_F_PKRU		BIT(8)
-
-#define SEV_SNAPSHOT_CPU_CTX_REQUIRED_MASK	\
-	(SEV_SNAPSHOT_CPU_CTX_F_SEGS |		\
-	 SEV_SNAPSHOT_CPU_CTX_F_BASES |		\
-	 SEV_SNAPSHOT_CPU_CTX_F_CONTROL |	\
-	 SEV_SNAPSHOT_CPU_CTX_F_EFER |		\
-	 SEV_SNAPSHOT_CPU_CTX_F_TABLES |	\
-	 SEV_SNAPSHOT_CPU_CTX_F_TR |		\
-	 SEV_SNAPSHOT_CPU_CTX_F_PKRU)
-
-static_assert(sizeof(struct sev_snapshot_cpu_context) == 0x11f8);
-
-extern void sev_snapshot_restore_entry_early(struct sev_snapshot_mailbox *mailbox);
-extern void sev_snapshot_restore_from_mailbox(struct sev_snapshot_mailbox *mailbox,
-					      u64 restore_cpu_id);
-extern void sev_snapshot_resume_from_ptregs(struct pt_regs *regs);
-extern void sev_snapshot_resume_kernel_thread_from_ptregs(
-	const struct pt_regs *regs);
-
-extern bool sev_snapshot_resume_in_progress;
 
 void sev_snapshot_seed_known_shared_extents(void);
 void sev_snapshot_reset_offline_ghcb_state(void);

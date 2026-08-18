@@ -4,7 +4,6 @@
 #endif
 
 #include <asm/ia32.h>
-#include "sev_snapshot.h"
 
 #if defined(CONFIG_KVM_GUEST)
 #include <asm/kvm_para.h>
@@ -52,18 +51,6 @@ int main(void)
 	ENTRY(cr3);
 	ENTRY(cr4);
 	ENTRY(gdt_desc);
-	BLANK();
-#undef ENTRY
-
-#define ENTRY(entry) OFFSET(SEV_SNAPSHOT_CPU_CONTEXT_ ## entry, \
-			    sev_snapshot_cpu_context, entry)
-	ENTRY(kernel_regs_ptr);
-	ENTRY(restore_mailbox_va);
-	ENTRY(cr0);
-	ENTRY(cr3);
-	ENTRY(cr4);
-	ENTRY(efer);
-	ENTRY(idt);
 	BLANK();
 #undef ENTRY
 
