@@ -182,11 +182,6 @@ struct ima_setup_data {
 	__u64 size;
 } __attribute__((packed));
 
-struct sev_snapshot_mailbox_desc {
-	__u64 phys_addr;
-	__u64 size;
-} __attribute__((packed));
-
 /* The so-called "zeropage" */
 struct boot_params {
 	struct screen_info screen_info;			/* 0x000 */

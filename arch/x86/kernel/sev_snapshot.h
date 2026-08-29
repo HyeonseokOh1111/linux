@@ -12,10 +12,10 @@
 #define __ARCH_X86_KERNEL_SEV_SNAPSHOT_H
 
 #include <linux/types.h>
+#include <linux/sizes.h>
 
 #include <asm/bootparam.h>
 #include <asm/desc_defs.h>
-#include <asm/ptrace.h>
 #include <asm/segment.h>
 #include <asm/sev-common.h>
 
@@ -24,133 +24,88 @@ struct sev_snapshot_shared_extent {
 	u64 npages;
 };
 
+struct sev_snapshot_shared_extent_header {
+	u32 shared_extent_count;
+	u32 _alignment_padding;
+};
+
+static_assert(sizeof(struct sev_snapshot_shared_extent_header) == sizeof(u64));
+
+#define SEV_SNAPSHOT_FIXED_MAILBOX_PA		0x00e00000ULL
+#define SEV_SNAPSHOT_MAILBOX_SIZE		SZ_2M
+#define SEV_SNAPSHOT_INPUT_PRIVATE_KEY_OFFSET	0x000ff000ULL
+#define SEV_SNAPSHOT_INPUT_PRIVATE_KEY_LEN	32U
+#define SEV_SNAPSHOT_LANDING_STACK_SCRATCH_SIZE	0x800UL
+#define SEV_SNAPSHOT_LANDING_STACK_ALIGNMENT	16UL
+#define SEV_SNAPSHOT_LANDING_STACK_SENTINEL_SIZE	8UL
+
+struct sev_snapshot_kernel_continuation {
+	u64 r15;
+	u64 r14;
+	u64 r13;
+	u64 r12;
+	u64 bp;
+	u64 bx;
+	u64 r11;
+	u64 r10;
+	u64 r9;
+	u64 r8;
+	u64 ax;
+	u64 cx;
+	u64 dx;
+	u64 si;
+	u64 di;
+	u64 ip;
+	u64 flags;
+	u64 sp;
+};
+
 struct sev_snapshot_cpu_context {
-	u32 context_size;
-	u32 valid_flags;
-	struct pt_regs regs;
-	u64 kernel_regs_ptr;
-	u64 restore_stub_rip;
+	struct sev_snapshot_kernel_continuation continuation;
 	u64 restore_mailbox_va;
-	u16 ds;
-	u16 es;
-	u16 fs;
-	u16 gs;
-	u16 ldt;
-	u16 tss;
 	u64 fs_base;
 	u64 kernel_gs_base;
 	u64 user_gs_base;
 	u64 cr0;
-	u64 cr2;
 	u64 cr3;
 	u64 cr4;
 	u64 efer;
-	struct desc_ptr gdt_desc;
-	struct desc_ptr idt;
-	u64 tr;
 	u64 xcr0;
-	u64 xstate_bv;
-	u32 xsave_len;
-	u32 xsave_max_size;
-	u32 pkru;
-	u8 gdt_copy[GDT_SIZE];
-	u8 xsave[PAGE_SIZE];
 	u64 restore_gdt_page_va;
 	u64 restore_gdt_page_pa;
 	u64 restore_from_mailbox_rip;
 	u64 hardirq_stack_ptr;
+	u32 pkru;
+	u8 gdt_copy[GDT_SIZE];
+	u8 xsave[PAGE_SIZE];
 };
-
-struct sev_snapshot_mailbox {
-	struct sev_snapshot_cpu_context cpu_ctx;
-	u32 shared_extent_count;
-	u32 reserved;
-	struct sev_snapshot_shared_extent shared_extents[];
-};
-
-#define SEV_SNAPSHOT_MAILBOX_V2_MAGIC		0x32565353U /* "SSV2" */
-#define SEV_SNAPSHOT_MAILBOX_V2_VERSION		1U
-#define SEV_SNAPSHOT_RESTORE_MODE_SINGLE_VCPU	0U
-#define SEV_SNAPSHOT_RESTORE_MODE_MULTI_VCPU	1U
-#define SEV_SNAPSHOT_V2_MIN_CPUS		1U
-#define SEV_SNAPSHOT_V2_MAX_CPUS		64U
-
-struct sev_snapshot_mailbox_v2_header {
-	u32 magic;
-	u16 version;
-	u16 header_size;
-	u32 mode;
-	u32 cpu_count;
-	u32 cpu_bundle_len;
-	u32 flags;
-	u32 reserved;
-};
-
-struct sev_snapshot_cpu_topology {
-	u32 linux_cpu_id;
-	u32 apic_id;
-	u32 vcpu_index;
-	u32 reserved;
-};
+#define SEV_SNAPSHOT_MIN_CPUS		1U
+#define SEV_SNAPSHOT_MAX_CPUS		64U
 
 struct sev_snapshot_restore_barrier {
-	u32 ready;
-	u32 ap_continue;
-	u32 ap_continue_ready;
-	u32 virtio_done;
-	u32 resume_ready;
-	u32 reserved[3];
+	u32 arrived;
+	u32 resume;
 };
 
-struct sev_snapshot_mailbox_v2 {
-	struct sev_snapshot_mailbox_v2_header header;
-	u8 payload[];
-};
+static_assert(sizeof(struct sev_snapshot_kernel_continuation) == 0x90);
+static_assert(sizeof(struct sev_snapshot_cpu_context) == 0x1180);
+static_assert(sizeof(struct sev_snapshot_restore_barrier) == 8);
+static_assert(offsetof(struct sev_snapshot_kernel_continuation, ip) == 120);
+static_assert(offsetof(struct sev_snapshot_kernel_continuation, flags) == 128);
+static_assert(offsetof(struct sev_snapshot_kernel_continuation, sp) == 136);
+static_assert(offsetof(struct sev_snapshot_cpu_context, restore_mailbox_va) == 144);
+static_assert(offsetof(struct sev_snapshot_cpu_context, cr3) == 184);
+static_assert(offsetof(struct sev_snapshot_cpu_context, restore_from_mailbox_rip) == 232);
+static_assert(offsetof(struct sev_snapshot_cpu_context, hardirq_stack_ptr) == 240);
+static_assert(offsetof(struct sev_snapshot_cpu_context, pkru) == 248);
+static_assert(offsetof(struct sev_snapshot_cpu_context, gdt_copy) == 252);
+static_assert(offsetof(struct sev_snapshot_cpu_context, xsave) == 380);
 
-#define SEV_SNAPSHOT_CPU_CTX_F_SEGS		BIT(0)
-#define SEV_SNAPSHOT_CPU_CTX_F_BASES		BIT(1)
-#define SEV_SNAPSHOT_CPU_CTX_F_CONTROL		BIT(2)
-#define SEV_SNAPSHOT_CPU_CTX_F_EFER		BIT(3)
-#define SEV_SNAPSHOT_CPU_CTX_F_TABLES		BIT(4)
-#define SEV_SNAPSHOT_CPU_CTX_F_TR		BIT(5)
-#define SEV_SNAPSHOT_CPU_CTX_F_XSAVE_META	BIT(6)
-#define SEV_SNAPSHOT_CPU_CTX_F_XSAVE_DATA	BIT(7)
-#define SEV_SNAPSHOT_CPU_CTX_F_PKRU		BIT(8)
+extern void __noreturn sev_snapshot_restore_from_mailbox(void *mailbox,
+						 u64 restore_cpu_id);
+extern void __noreturn sev_snapshot_resume_kernel_continuation(
+	const struct sev_snapshot_kernel_continuation *continuation);
 
-#define SEV_SNAPSHOT_CPU_CTX_REQUIRED_MASK	\
-	(SEV_SNAPSHOT_CPU_CTX_F_SEGS |		\
-	 SEV_SNAPSHOT_CPU_CTX_F_BASES |		\
-	 SEV_SNAPSHOT_CPU_CTX_F_CONTROL |	\
-	 SEV_SNAPSHOT_CPU_CTX_F_EFER |		\
-	 SEV_SNAPSHOT_CPU_CTX_F_TABLES |	\
-	 SEV_SNAPSHOT_CPU_CTX_F_TR |		\
-	 SEV_SNAPSHOT_CPU_CTX_F_PKRU)
-
-static_assert(sizeof(struct sev_snapshot_cpu_context) == 0x11f8);
-
-extern void sev_snapshot_restore_entry_early(struct sev_snapshot_mailbox *mailbox);
-extern void sev_snapshot_restore_from_mailbox(struct sev_snapshot_mailbox *mailbox,
-					      u64 restore_cpu_id);
-extern void sev_snapshot_resume_from_ptregs(struct pt_regs *regs);
-extern void sev_snapshot_resume_kernel_thread_from_ptregs(
-	const struct pt_regs *regs);
-
-extern bool sev_snapshot_resume_in_progress;
-
-void sev_snapshot_seed_known_shared_extents(void);
-void sev_snapshot_reset_offline_ghcb_state(void);
-void sev_snapshot_register_boot_ghcb(void);
-void sev_snapshot_register_runtime_ghcb(void);
-void sev_snapshot_register_runtime_ghcb_cpu(unsigned int cpu);
-u64 sev_snapshot_runtime_ghcb_pa(void);
-void sev_snapshot_track_page_state_pa(unsigned long paddr, unsigned int npages,
-				      enum psc_op op);
-void sev_snapshot_track_page_state(unsigned long addr, unsigned int npages,
-				   enum psc_op op);
-void sev_snapshot_track_psc_entries(struct psc_entry *entries,
-				    unsigned int nr_entries, enum psc_op op);
-
-int sev_es_ghcb_vmmcall_rax(u64 rax);
-int sev_es_ghcb_msr_signal(u64 val);
+bool sev_snapshot_mailbox_available(void);
 
 #endif /* __ARCH_X86_KERNEL_SEV_SNAPSHOT_H */

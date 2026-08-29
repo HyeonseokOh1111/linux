@@ -551,59 +551,55 @@ err:
 }
 EXPORT_SYMBOL_GPL(virtio_device_restore);
 
-static int virtio_sev_snapshot_freeze_one(struct device *dev, void *data)
+enum virtio_sev_snapshot_action {
+	VIRTIO_SEV_SNAPSHOT_FREEZE,
+	VIRTIO_SEV_SNAPSHOT_RESTORE,
+};
+
+struct virtio_sev_snapshot_visit {
+	enum virtio_sev_snapshot_action action;
+	int ret;
+};
+
+static int virtio_sev_snapshot_visit_one(struct device *dev, void *data)
 {
 	struct virtio_device *vdev = dev_to_virtio(dev);
+	struct virtio_sev_snapshot_visit *visit = data;
 	struct virtio_driver *drv;
-	int *ret = data;
 
-	if (*ret || !dev->driver)
+	if (visit->ret || !dev->driver)
 		return 0;
 
 	drv = drv_to_virtio(dev->driver);
 	if (!drv->freeze || !drv->restore)
 		return 0;
 
-	*ret = virtio_device_freeze(vdev);
+	if (visit->action == VIRTIO_SEV_SNAPSHOT_FREEZE)
+		visit->ret = virtio_device_freeze(vdev);
+	else
+		visit->ret = virtio_device_restore(vdev);
 	return 0;
+}
+
+static int virtio_sev_snapshot_visit_devices(
+	enum virtio_sev_snapshot_action action)
+{
+	struct virtio_sev_snapshot_visit visit = { .action = action };
+
+	bus_for_each_dev(&virtio_bus, NULL, &visit,
+			 virtio_sev_snapshot_visit_one);
+	return visit.ret;
 }
 
 int virtio_sev_snapshot_freeze_devices(void)
 {
-	int ret = 0;
-
-	bus_for_each_dev(&virtio_bus, NULL, &ret,
-			 virtio_sev_snapshot_freeze_one);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(virtio_sev_snapshot_freeze_devices);
-
-static int virtio_sev_snapshot_restore_one(struct device *dev, void *data)
-{
-	struct virtio_device *vdev = dev_to_virtio(dev);
-	struct virtio_driver *drv;
-	int *ret = data;
-
-	if (*ret || !dev->driver)
-		return 0;
-
-	drv = drv_to_virtio(dev->driver);
-	if (!drv->freeze || !drv->restore)
-		return 0;
-
-	*ret = virtio_device_restore(vdev);
-	return 0;
+	return virtio_sev_snapshot_visit_devices(VIRTIO_SEV_SNAPSHOT_FREEZE);
 }
 
 int virtio_sev_snapshot_restore_devices(void)
 {
-	int ret = 0;
-
-	bus_for_each_dev(&virtio_bus, NULL, &ret,
-			 virtio_sev_snapshot_restore_one);
-	return ret;
+	return virtio_sev_snapshot_visit_devices(VIRTIO_SEV_SNAPSHOT_RESTORE);
 }
-EXPORT_SYMBOL_GPL(virtio_sev_snapshot_restore_devices);
 
 static int virtio_init(void)
 {

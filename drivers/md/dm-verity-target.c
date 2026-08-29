@@ -22,8 +22,6 @@
 #include <linux/scatterlist.h>
 #include <linux/string.h>
 #include <linux/jump_label.h>
-#include <linux/ktime.h>
-#include <linux/atomic.h>
 
 #define DM_MSG_PREFIX			"verity"
 
@@ -45,24 +43,8 @@
 					 DM_VERITY_ROOT_HASH_VERIFICATION_OPTS)
 
 static unsigned int dm_verity_prefetch_cluster = DM_VERITY_DEFAULT_PREFETCH_SIZE;
-static atomic64_t dm_verity_read_verify_ns = ATOMIC64_INIT(0);
-
-static int dm_verity_read_verify_ns_get(char *buffer,
-					const struct kernel_param *kp)
-{
-	(void)kp;
-	return scnprintf(buffer, PAGE_SIZE, "%lld\n",
-			 atomic64_read(&dm_verity_read_verify_ns));
-}
-
-static const struct kernel_param_ops dm_verity_read_verify_ns_ops = {
-	.get = dm_verity_read_verify_ns_get,
-};
 
 module_param_named(prefetch_cluster, dm_verity_prefetch_cluster, uint, 0644);
-module_param_cb(read_verify_ns, &dm_verity_read_verify_ns_ops, NULL, 0444);
-MODULE_PARM_DESC(read_verify_ns,
-		 "Accumulated nanoseconds spent in dm-verity read verification");
 
 static DEFINE_STATIC_KEY_FALSE(use_tasklet_enabled);
 
@@ -521,7 +503,7 @@ static inline void verity_bv_skip_block(struct dm_verity *v,
 /*
  * Verify one "dm_verity_io" structure.
  */
-static int verity_verify_io_inner(struct dm_verity_io *io)
+static int verity_verify_io(struct dm_verity_io *io)
 {
 	bool is_zero;
 	struct dm_verity *v = io->v;
@@ -625,16 +607,6 @@ static int verity_verify_io_inner(struct dm_verity_io *io)
 	}
 
 	return 0;
-}
-
-static int verity_verify_io(struct dm_verity_io *io)
-{
-	u64 start_ns = ktime_get_ns();
-	int r = verity_verify_io_inner(io);
-
-	atomic64_add((s64)(ktime_get_ns() - start_ns),
-		     &dm_verity_read_verify_ns);
-	return r;
 }
 
 /*

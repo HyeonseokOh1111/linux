@@ -24,13 +24,18 @@
 #include <linux/platform_device.h>
 #include <linux/io.h>
 #include <linux/psp-sev.h>
-#include <linux/swiotlb.h>
-#include <linux/sizes.h>
+#include <linux/init.h>
 #include <linux/mutex.h>
+#include <linux/scatterlist.h>
 #include <linux/syscalls.h>
 #include <linux/uaccess.h>
-#include <crypto/aes.h>
+#include <linux/string.h>
+#include <crypto/aead.h>
 #include <uapi/linux/sev-guest.h>
+
+#if IS_ENABLED(CONFIG_KUNIT)
+#include <kunit/test.h>
+#endif
 
 #include <asm/cpu_entry_area.h>
 #include <asm/stacktrace.h>
@@ -47,6 +52,7 @@
 #include <asm/apic.h>
 #include <asm/cpuid.h>
 #include <asm/cmdline.h>
+#include <asm/unaligned.h>
 
 #include "sev_snapshot.h"
 
@@ -83,127 +89,265 @@ static u64 sev_hv_features __ro_after_init;
 #define FAASEV_INPUT_PRIVATE_KEY_LEN	32
 #define FAASEV_SHADOW_CRYPTO_DECRYPT	0
 #define FAASEV_SHADOW_CRYPTO_ENCRYPT	1
+#define FAASEV_SHADOW_CRYPTO_RECORD_SIZE	512
+#define FAASEV_SHADOW_CRYPTO_TAG_LEN	16
+#define FAASEV_SHADOW_CRYPTO_IV_LEN	12
+#define FAASEV_SHADOW_CRYPTO_BUFFER_LEN	\
+	(FAASEV_SHADOW_CRYPTO_RECORD_SIZE + FAASEV_SHADOW_CRYPTO_TAG_LEN)
 
-static DEFINE_MUTEX(faasev_input_private_key_lock);
-static u8 faasev_input_private_key[FAASEV_INPUT_PRIVATE_KEY_LEN];
-static bool faasev_input_private_key_ready;
-static u64 faasev_secrets_gpa;
+static DEFINE_MUTEX(faasev_shadow_crypto_lock);
+static struct crypto_aead *faasev_shadow_crypto_tfm;
+static struct aead_request *faasev_shadow_crypto_req;
+static u8 faasev_shadow_crypto_buffer[FAASEV_SHADOW_CRYPTO_BUFFER_LEN]
+	__aligned(16);
+static bool faasev_shadow_crypto_key_ready;
 
-static bool faasev_buffer_is_zero(const u8 *buffer, size_t len)
+enum faasev_input_key_mode {
+	FAASEV_INPUT_KEY_INVALID,
+	FAASEV_INPUT_KEY_USER,
+	FAASEV_INPUT_KEY_MAILBOX,
+};
+
+static enum faasev_input_key_mode faasev_input_key_mode(
+	const u8 __user *input_key, size_t input_key_len)
 {
-	size_t index;
-
-	for (index = 0; index < len; index++) {
-		if (buffer[index])
-			return false;
-	}
-
-	return true;
+	if (input_key && input_key_len == FAASEV_INPUT_PRIVATE_KEY_LEN)
+		return FAASEV_INPUT_KEY_USER;
+	if (!input_key && !input_key_len)
+		return FAASEV_INPUT_KEY_MAILBOX;
+	return FAASEV_INPUT_KEY_INVALID;
 }
 
-static int faasev_load_input_private_key_from_secrets_locked(void)
+static int faasev_consume_input_key_slot(
+	u8 slot[FAASEV_INPUT_PRIVATE_KEY_LEN],
+	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN])
 {
-	struct snp_secrets_page_layout *layout;
-	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN];
-	void __iomem *mem;
+	memcpy(key, slot, FAASEV_INPUT_PRIVATE_KEY_LEN);
+	memzero_explicit(slot, FAASEV_INPUT_PRIVATE_KEY_LEN);
+	return memchr_inv(key, 0, FAASEV_INPUT_PRIVATE_KEY_LEN) ? 0 : -ENOKEY;
+}
 
-	if (faasev_input_private_key_ready)
+static int faasev_shadow_crypto_init_locked(void)
+{
+	struct crypto_aead *tfm;
+	struct aead_request *req;
+	int ret;
+
+	if (faasev_shadow_crypto_req)
 		return 0;
 
-	if (!faasev_secrets_gpa)
-		return -ENOKEY;
+	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
 
-	mem = ioremap_encrypted(faasev_secrets_gpa, PAGE_SIZE);
-	if (!mem)
-		return -ENOMEM;
+	ret = crypto_aead_setauthsize(tfm, FAASEV_SHADOW_CRYPTO_TAG_LEN);
+	if (ret)
+		goto out_free_tfm;
 
-	layout = (__force struct snp_secrets_page_layout *)mem;
-	memcpy(key, layout->os_area.rsvd, sizeof(key));
-	iounmap(mem);
-
-	if (faasev_buffer_is_zero(key, sizeof(key))) {
-		memzero_explicit(key, sizeof(key));
-		return -ENOKEY;
+	req = aead_request_alloc(tfm, GFP_KERNEL);
+	if (!req) {
+		ret = -ENOMEM;
+		goto out_free_tfm;
 	}
 
-	memcpy(faasev_input_private_key, key, sizeof(key));
-	faasev_input_private_key_ready = true;
-	memzero_explicit(key, sizeof(key));
+	memset(faasev_shadow_crypto_buffer, 0xa5,
+	       sizeof(faasev_shadow_crypto_buffer));
+	faasev_shadow_crypto_tfm = tfm;
+	faasev_shadow_crypto_req = req;
 	return 0;
+
+out_free_tfm:
+	crypto_free_aead(tfm);
+	return ret;
+}
+
+int sev_snapshot_prepare_shadow_crypto(void)
+{
+	int ret;
+
+	/*
+	 * Capture the persistent transform/request in the snapshot. The restore
+	 * key is installed only after userspace consumes the private mailbox slot.
+	 */
+	mutex_lock(&faasev_shadow_crypto_lock);
+	ret = faasev_shadow_crypto_init_locked();
+	mutex_unlock(&faasev_shadow_crypto_lock);
+	return ret;
+}
+
+static int faasev_shadow_crypto_install_key_locked(
+	const u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN])
+{
+	int ret;
+
+	if (!faasev_shadow_crypto_tfm || !faasev_shadow_crypto_req)
+		return -ENODEV;
+
+	faasev_shadow_crypto_key_ready = false;
+	ret = crypto_aead_setkey(faasev_shadow_crypto_tfm, key,
+				 FAASEV_INPUT_PRIVATE_KEY_LEN);
+	if (!ret)
+		faasev_shadow_crypto_key_ready = true;
+	return ret;
 }
 
 SYSCALL_DEFINE2(faasev_seed_input_key, const u8 __user *, input_key,
 		size_t, input_key_len)
 {
-	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN];
+	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN] = {};
+	u8 *mailbox_key;
+	enum faasev_input_key_mode mode;
+	int ret;
 
-	if (input_key_len != sizeof(key))
+	mode = faasev_input_key_mode(input_key, input_key_len);
+	if (mode == FAASEV_INPUT_KEY_INVALID)
 		return -EINVAL;
-	if (copy_from_user(key, input_key, sizeof(key)))
-		return -EFAULT;
-	if (faasev_buffer_is_zero(key, sizeof(key))) {
-		memzero_explicit(key, sizeof(key));
-		return -EINVAL;
+
+	if (mode == FAASEV_INPUT_KEY_USER &&
+	    copy_from_user(key, input_key, sizeof(key))) {
+		ret = -EFAULT;
+		goto out_zero;
 	}
 
-	mutex_lock(&faasev_input_private_key_lock);
-	memcpy(faasev_input_private_key, key, sizeof(key));
-	faasev_input_private_key_ready = true;
-	mutex_unlock(&faasev_input_private_key_lock);
+	mutex_lock(&faasev_shadow_crypto_lock);
+	if (mode == FAASEV_INPUT_KEY_MAILBOX) {
+		if (!sev_snapshot_mailbox_available()) {
+			ret = -ENODEV;
+			goto out_unlock;
+		}
 
+		mailbox_key = __va(SEV_SNAPSHOT_FIXED_MAILBOX_PA +
+				   SEV_SNAPSHOT_INPUT_PRIVATE_KEY_OFFSET);
+		ret = faasev_consume_input_key_slot(mailbox_key, key);
+		if (ret)
+			goto out_unlock;
+	}
+
+	if (!memchr_inv(key, 0, sizeof(key))) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	ret = faasev_shadow_crypto_init_locked();
+	if (!ret)
+		ret = faasev_shadow_crypto_install_key_locked(key);
+
+out_unlock:
+	mutex_unlock(&faasev_shadow_crypto_lock);
+out_zero:
 	memzero_explicit(key, sizeof(key));
-	return 0;
+	return ret;
+}
+
+#if IS_ENABLED(CONFIG_KUNIT)
+static void faasev_input_key_modes_are_exact(struct kunit *test)
+{
+	const u8 __user *user_key = (const u8 __user *)1UL;
+
+	KUNIT_EXPECT_EQ(test,
+		faasev_input_key_mode(user_key, FAASEV_INPUT_PRIVATE_KEY_LEN),
+		FAASEV_INPUT_KEY_USER);
+	KUNIT_EXPECT_EQ(test, faasev_input_key_mode(NULL, 0),
+		FAASEV_INPUT_KEY_MAILBOX);
+	KUNIT_EXPECT_EQ(test, faasev_input_key_mode(user_key, 0),
+		FAASEV_INPUT_KEY_INVALID);
+	KUNIT_EXPECT_EQ(test,
+		faasev_input_key_mode(NULL, FAASEV_INPUT_PRIVATE_KEY_LEN),
+		FAASEV_INPUT_KEY_INVALID);
+	KUNIT_EXPECT_EQ(test, faasev_input_key_mode(user_key, 31),
+		FAASEV_INPUT_KEY_INVALID);
+}
+
+static void faasev_mailbox_key_is_one_shot(struct kunit *test)
+{
+	u8 slot[FAASEV_INPUT_PRIVATE_KEY_LEN];
+	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN] = {};
+
+	memset(slot, 0x5a, sizeof(slot));
+	KUNIT_ASSERT_EQ(test, faasev_consume_input_key_slot(slot, key), 0);
+	KUNIT_EXPECT_PTR_EQ(test, memchr_inv(slot, 0, sizeof(slot)), NULL);
+	KUNIT_EXPECT_NOT_NULL(test, memchr_inv(key, 0, sizeof(key)));
+	memzero_explicit(key, sizeof(key));
+	KUNIT_EXPECT_EQ(test, faasev_consume_input_key_slot(slot, key), -ENOKEY);
+	KUNIT_EXPECT_PTR_EQ(test, memchr_inv(slot, 0, sizeof(slot)), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, memchr_inv(key, 0, sizeof(key)), NULL);
+}
+
+static struct kunit_case faasev_input_key_cases[] = {
+	KUNIT_CASE(faasev_input_key_modes_are_exact),
+	KUNIT_CASE(faasev_mailbox_key_is_one_shot),
+	{}
+};
+
+static struct kunit_suite faasev_input_key_suite = {
+	.name = "faasev_input_key",
+	.test_cases = faasev_input_key_cases,
+};
+
+kunit_test_suite(faasev_input_key_suite);
+#endif
+
+static int faasev_shadow_crypto_local_sim(unsigned int operation,
+					  size_t payload_len)
+{
+	DECLARE_CRYPTO_WAIT(wait);
+	size_t record_count = DIV_ROUND_UP(payload_len,
+					   FAASEV_SHADOW_CRYPTO_RECORD_SIZE);
+	u64 record_index;
+	u64 acc = ((u64)operation << 32) ^ payload_len;
+	struct scatterlist sg;
+	u8 iv[FAASEV_SHADOW_CRYPTO_IV_LEN];
+	int ret = 0;
+
+	mutex_lock(&faasev_shadow_crypto_lock);
+	if (!faasev_shadow_crypto_key_ready) {
+		ret = -ENOKEY;
+		goto out_unlock;
+	}
+
+	aead_request_set_callback(faasev_shadow_crypto_req,
+				  CRYPTO_TFM_REQ_MAY_BACKLOG |
+				  CRYPTO_TFM_REQ_MAY_SLEEP,
+				  crypto_req_done, &wait);
+
+	for (record_index = 0; record_index < record_count; record_index++) {
+		put_unaligned_le64(0x46535653474d0001ULL ^ record_index,
+				   iv);
+		put_unaligned_le32(0xaead0000U ^ operation, iv + 8);
+		sg_init_one(&sg, faasev_shadow_crypto_buffer,
+			    sizeof(faasev_shadow_crypto_buffer));
+		aead_request_set_crypt(faasev_shadow_crypto_req,
+				       &sg, &sg,
+				       FAASEV_SHADOW_CRYPTO_RECORD_SIZE,
+				       iv);
+		aead_request_set_ad(faasev_shadow_crypto_req, 0);
+
+		ret = crypto_wait_req(crypto_aead_encrypt(faasev_shadow_crypto_req),
+				      &wait);
+		if (ret)
+			goto out_unlock;
+
+		acc ^= get_unaligned_le64(faasev_shadow_crypto_buffer +
+					  FAASEV_SHADOW_CRYPTO_RECORD_SIZE);
+	}
+
+	barrier_data(&acc);
+
+out_unlock:
+	mutex_unlock(&faasev_shadow_crypto_lock);
+	return ret;
 }
 
 SYSCALL_DEFINE2(faasev_shadow_crypto, unsigned int, operation,
 		size_t, payload_len)
 {
-	struct crypto_aes_ctx aes_ctx;
-	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN];
-	u8 block[AES_BLOCK_SIZE];
-	u8 output[AES_BLOCK_SIZE];
-	size_t block_count;
-	size_t index;
-	int ret;
-
 	if (operation != FAASEV_SHADOW_CRYPTO_DECRYPT &&
 	    operation != FAASEV_SHADOW_CRYPTO_ENCRYPT)
 		return -EINVAL;
 	if (!payload_len)
 		return 0;
 
-	mutex_lock(&faasev_input_private_key_lock);
-	ret = faasev_load_input_private_key_from_secrets_locked();
-	if (!ret)
-		memcpy(key, faasev_input_private_key, sizeof(key));
-	mutex_unlock(&faasev_input_private_key_lock);
-	if (ret)
-		return ret;
-
-	ret = aes_expandkey(&aes_ctx, key, sizeof(key));
-	memzero_explicit(key, sizeof(key));
-	if (ret)
-		return ret;
-
-	memset(block, 0, sizeof(block));
-	block_count = DIV_ROUND_UP(payload_len, AES_BLOCK_SIZE);
-	for (index = 0; index < block_count; index++) {
-		block[0] ^= (u8)index;
-		block[1] ^= (u8)(index >> 8);
-		block[2] ^= (u8)(index >> 16);
-		block[3] ^= (u8)(index >> 24);
-		if (operation == FAASEV_SHADOW_CRYPTO_ENCRYPT)
-			aes_encrypt(&aes_ctx, output, block);
-		else
-			aes_decrypt(&aes_ctx, output, block);
-		memcpy(block, output, sizeof(block));
-	}
-
-	barrier_data(block);
-	memzero_explicit(block, sizeof(block));
-	memzero_explicit(output, sizeof(output));
-	memzero_explicit(&aes_ctx, sizeof(aes_ctx));
-	return 0;
+	return faasev_shadow_crypto_local_sim(operation, payload_len);
 }
 
 /* #VC handler runtime per-CPU data */
@@ -258,36 +402,6 @@ struct sev_config {
 };
 
 static struct sev_config sev_cfg __read_mostly;
-
-void sev_snapshot_seed_known_shared_extents(void)
-{
-	unsigned long swiotlb_bytes;
-	int cpu;
-
-	if (!(sev_status & MSR_AMD64_SEV_SNP_ENABLED))
-		return;
-
-	for_each_possible_cpu(cpu) {
-		struct sev_es_runtime_data *data = per_cpu(runtime_data, cpu);
-
-		if (!data)
-			continue;
-
-		sev_snapshot_track_page_state_pa(__pa(&data->ghcb_page), 1,
-						 SNP_PAGE_STATE_SHARED);
-	}
-
-	if (!io_tlb_default_mem.nslabs || !io_tlb_default_mem.vaddr)
-		return;
-
-	swiotlb_bytes = PAGE_ALIGN(io_tlb_default_mem.nslabs << IO_TLB_SHIFT);
-	if (!swiotlb_bytes)
-		return;
-
-	sev_snapshot_track_page_state_pa(io_tlb_default_mem.start,
-					 swiotlb_bytes >> PAGE_SHIFT,
-					 SNP_PAGE_STATE_SHARED);
-}
 
 static __always_inline bool on_vc_stack(struct pt_regs *regs)
 {
@@ -810,66 +924,6 @@ static u64 __init get_jump_table_addr(void)
 	return ret;
 }
 
-int sev_es_ghcb_vmmcall_rax(u64 rax)
-{
-	struct ghcb_state state;
-	struct es_em_ctxt ctxt = {};
-	unsigned long flags;
-	struct ghcb *ghcb;
-	enum es_result res;
-	int ret = -EIO;
-
-	local_irq_save(flags);
-
-	ghcb = __sev_get_ghcb(&state);
-	if (!ghcb)
-		goto out_restore_irq;
-
-	vc_ghcb_invalidate(ghcb);
-	ghcb_set_rax(ghcb, rax);
-	ghcb_set_cpl(ghcb, 0);
-
-	res = sev_es_ghcb_hv_call(ghcb, &ctxt, SVM_EXIT_VMMCALL, 0, 0);
-	if (res != ES_OK)
-		goto out_put;
-
-	if (!ghcb_rax_is_valid(ghcb))
-		goto out_put;
-
-	ret = ghcb->save.rax;
-
-out_put:
-	__sev_put_ghcb(&state);
-out_restore_irq:
-	local_irq_restore(flags);
-	return ret;
-}
-
-int sev_es_ghcb_msr_signal(u64 val)
-{
-	struct ghcb_state state;
-	unsigned long flags;
-	struct ghcb *ghcb;
-	int ret = -EIO;
-
-	local_irq_save(flags);
-
-	ghcb = __sev_get_ghcb(&state);
-	if (!ghcb)
-		goto out_restore_irq;
-
-	vc_ghcb_invalidate(ghcb);
-	sev_es_wr_ghcb_msr(val);
-	VMGEXIT();
-	sev_es_wr_ghcb_msr(__pa(ghcb));
-	ret = 0;
-
-	__sev_put_ghcb(&state);
-out_restore_irq:
-	local_irq_restore(flags);
-	return ret;
-}
-
 static void pvalidate_pages(unsigned long vaddr, unsigned int npages, bool validate)
 {
 	unsigned long vaddr_end;
@@ -1093,15 +1147,6 @@ static unsigned long __set_pages_state(struct snp_psc_desc *data,
 		e->pagesize = RMP_PG_SIZE_4K;
 		entry_size = PAGE_SIZE;
 
-		if (op == SNP_PAGE_STATE_SHARED &&
-		    !is_vmalloc_addr((void *)vaddr) &&
-		    vaddr_end - vaddr >= SZ_2M &&
-		    swiotlb_is_hugepage_range((phys_addr_t)pfn << PAGE_SHIFT,
-					       SZ_2M)) {
-			e->pagesize = RMP_PG_SIZE_2M;
-			entry_size = SZ_2M;
-		}
-
 		vaddr += entry_size;
 		e++;
 		i++;
@@ -1127,8 +1172,6 @@ static void set_pages_state(unsigned long vaddr, unsigned int npages, int op)
 
 	while (vaddr < vaddr_end) {
 		vaddr = __set_pages_state(desc, vaddr, vaddr_end, op);
-		sev_snapshot_track_psc_entries(desc->entries,
-					desc->hdr.end_entry + 1, op);
 	}
 
 	kfree(desc);
@@ -1191,7 +1234,7 @@ static void *snp_alloc_vmsa_page(void)
 	 *
 	 * Allocate an 8k page which is also 8k-aligned.
 	 */
-	p = alloc_pages(GFP_KERNEL_ACCOUNT, 1);
+	p = alloc_pages(GFP_KERNEL_ACCOUNT | __GFP_ZERO, 1);
 	if (!p)
 		return NULL;
 
@@ -1199,14 +1242,6 @@ static void *snp_alloc_vmsa_page(void)
 
 	/* Free the first 4k. This page may be 2M/1G aligned and cannot be used. */
 	__free_page(p);
-
-	/*
-	 * Restore can lazily materialize private pages.  AP creation hands this
-	 * GPA directly to KVM as a VMSA, so force the host-side private backing
-	 * to exist before RMPADJUST marks the page as VMSA.
-	 */
-	snp_set_memory_private((unsigned long)page_address(p + 1), 1);
-	memset(page_address(p + 1), 0, PAGE_SIZE);
 
 	return page_address(p + 1);
 }
@@ -1484,145 +1519,8 @@ static void snp_register_per_cpu_ghcb(void)
 	snp_register_ghcb_early(__pa(ghcb));
 }
 
-static void snp_register_snapshot_boot_ghcb_cpu(unsigned int cpu)
+static void setup_runtime_ghcb(void)
 {
-	struct sev_es_runtime_data *data;
-	struct ghcb *ghcb;
-	unsigned long paddr, pfn;
-	u64 req, val;
-
-	/*
-	 * Snapshot restore resumes on the boot vCPU before the restored
-	 * per-CPU GS base is fully reinstated, so do not rely on
-	 * this_cpu_read(runtime_data) here.
-	 */
-	data = per_cpu(runtime_data, cpu);
-	ghcb = &data->ghcb_page;
-	paddr = __pa(ghcb);
-	pfn = paddr >> PAGE_SHIFT;
-	req = GHCB_MSR_REG_GPA_REQ_VAL(pfn);
-
-	sev_es_wr_ghcb_msr(req);
-	VMGEXIT();
-
-	val = sev_es_rd_ghcb_msr();
-
-	if ((GHCB_RESP_CODE(val) != GHCB_MSR_REG_GPA_RESP) ||
-	    (GHCB_MSR_REG_GPA_RESP_VAL(val) != pfn))
-		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_REGISTER);
-}
-
-static void snp_register_snapshot_boot_ghcb(void)
-{
-	snp_register_snapshot_boot_ghcb_cpu(0);
-}
-
-void sev_snapshot_register_runtime_ghcb(void)
-{
-	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
-		return;
-
-	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
-		return;
-
-	snp_register_snapshot_boot_ghcb();
-}
-
-void sev_snapshot_register_runtime_ghcb_cpu(unsigned int cpu)
-{
-	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
-		return;
-
-	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
-		return;
-
-	snp_register_snapshot_boot_ghcb_cpu(cpu);
-}
-
-void sev_snapshot_reset_offline_ghcb_state(void)
-{
-	int cpu;
-
-	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
-		return;
-
-	for_each_possible_cpu(cpu) {
-		struct sev_es_runtime_data *data;
-
-		if (cpu_online(cpu))
-			continue;
-
-		data = per_cpu(runtime_data, cpu);
-		if (!data)
-			continue;
-
-		data->ghcb_active = false;
-		data->backup_ghcb_active = false;
-		vc_ghcb_invalidate(&data->ghcb_page);
-		vc_ghcb_invalidate(&data->backup_ghcb);
-	}
-}
-
-bool sev_snapshot_negotiate_runtime_ghcb_protocol(void)
-{
-	u64 val;
-	u16 current_version;
-	u16 negotiated_version;
-
-	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
-		return true;
-
-	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
-		return true;
-
-	sev_es_wr_ghcb_msr(GHCB_MSR_SEV_INFO_REQ);
-	VMGEXIT();
-
-	val = sev_es_rd_ghcb_msr();
-
-	if (GHCB_MSR_INFO(val) != GHCB_MSR_SEV_INFO_RESP)
-		return false;
-
-	if (GHCB_MSR_PROTO_MAX(val) < GHCB_PROTOCOL_MIN ||
-	    GHCB_MSR_PROTO_MIN(val) > GHCB_PROTOCOL_MAX)
-		return false;
-
-	negotiated_version =
-		min_t(size_t, GHCB_MSR_PROTO_MAX(val), GHCB_PROTOCOL_MAX);
-	current_version = READ_ONCE(ghcb_version);
-	if (!current_version)
-		return false;
-
-	return true;
-}
-
-u64 sev_snapshot_runtime_ghcb_pa(void)
-{
-	struct sev_es_runtime_data *data;
-
-	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
-		return 0;
-
-	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
-		return 0;
-
-	data = this_cpu_read(runtime_data);
-	if (!data)
-		return 0;
-
-	return __pa(&data->ghcb_page);
-}
-
-void setup_ghcb(void)
-{
-	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
-		return;
-
-	/* First make sure the hypervisor talks a supported protocol. */
-	if (!READ_ONCE(ghcb_version) && !sev_es_negotiate_protocol()) {
-		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
-	}
-
 	/*
 	 * Check whether the runtime #VC exception handler is active. It uses
 	 * the per-CPU GHCB page which is set up by sev_es_init_vc_handling().
@@ -1648,6 +1546,47 @@ void setup_ghcb(void)
 	/* SNP guest requires that GHCB GPA must be registered. */
 	if (cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
 		snp_register_ghcb_early(__pa(&boot_ghcb_page));
+}
+
+void setup_ghcb(void)
+{
+	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
+		return;
+
+	/* First make sure the hypervisor talks a supported protocol. */
+	if (!sev_es_negotiate_protocol())
+		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
+
+	setup_runtime_ghcb();
+}
+
+void setup_ghcb_for_snapshot_restore(void)
+{
+	struct sev_es_runtime_data *data;
+	unsigned long ghcb_paddr;
+	u64 val;
+
+	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
+		return;
+
+	/*
+	 * The authenticated snapshot already contains the negotiated GHCB
+	 * protocol version, which is __ro_after_init by restore time. The runtime
+	 * GHCB was shared in the captured kernel, but a fresh Template launch does
+	 * not inherit that RMP state. Establish the shared state through the MSR
+	 * protocol before registering the page or activating the restored #VC IDT.
+	 */
+	data = this_cpu_read(runtime_data);
+	ghcb_paddr = __pa(&data->ghcb_page);
+	sev_es_wr_ghcb_msr(GHCB_MSR_PSC_REQ_GFN(ghcb_paddr >> PAGE_SHIFT,
+						SNP_PAGE_STATE_SHARED));
+	VMGEXIT();
+	val = sev_es_rd_ghcb_msr();
+	if (GHCB_RESP_CODE(val) != GHCB_MSR_PSC_RESP ||
+	    GHCB_MSR_PSC_RESP_VAL(val))
+		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PSC);
+
+	setup_runtime_ghcb();
 }
 
 #ifdef CONFIG_HOTPLUG_CPU
@@ -1901,20 +1840,8 @@ static enum es_result vc_handle_mmio_movs(struct es_em_ctxt *ctxt,
 		return ES_RETRY;
 }
 
-static enum es_result vc_handle_invalid(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
+static enum es_result vc_handle_lazy_restore_fault(struct es_em_ctxt *ctxt)
 {
-	unsigned long fault_addr;
-
-	(void)ghcb;
-
-	fault_addr = native_read_cr2();
-
-	if (user_mode(ctxt->regs))
-		stac();
-	pvalidate_pages(fault_addr, 1, true);
-	if (user_mode(ctxt->regs))
-		clac();
-
 	ctxt->insn.length = 0;
 	return ES_OK;
 }
@@ -2191,7 +2118,7 @@ static enum es_result vc_handle_exitcode(struct es_em_ctxt *ctxt,
 		result = vc_handle_mmio(ghcb, ctxt);
 		break;
 	case 0x404:
-		result = vc_handle_invalid(ghcb, ctxt);
+		result = vc_handle_lazy_restore_fault(ctxt);
 		break;
 	default:
 		/*
@@ -2645,7 +2572,6 @@ static int __init snp_init_platform_device(void)
 	if (!gpa)
 		return -ENODEV;
 
-	faasev_secrets_gpa = gpa;
 	data.secrets_gpa = gpa;
 	if (platform_device_add_data(&sev_guest_device, &data, sizeof(data)))
 		return -ENODEV;

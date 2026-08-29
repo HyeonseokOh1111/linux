@@ -1463,5 +1463,10 @@ void __init trap_init(void)
 	cpu_init_exception_handling();
 	/* Setup traps as cpu_init() might #GP */
 	idt_setup_traps();
+	/*
+	 * Intercepted MSRs require the runtime GHCB, TSS, and runtime #VC IDT
+	 * to be active on the boot CPU.
+	 */
+	setup_getcpu_msr(raw_smp_processor_id());
 	cpu_init();
 }

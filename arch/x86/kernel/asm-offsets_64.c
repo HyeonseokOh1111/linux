@@ -46,24 +46,35 @@ int main(void)
 	BLANK();
 #undef ENTRY
 
+#define ENTRY(entry) OFFSET(sev_snapshot_cont_ ## entry, \
+			    sev_snapshot_kernel_continuation, entry)
+	ENTRY(r15);
+	ENTRY(r14);
+	ENTRY(r13);
+	ENTRY(r12);
+	ENTRY(bp);
+	ENTRY(bx);
+	ENTRY(r11);
+	ENTRY(r10);
+	ENTRY(r9);
+	ENTRY(r8);
+	ENTRY(ax);
+	ENTRY(cx);
+	ENTRY(dx);
+	ENTRY(si);
+	ENTRY(di);
+	ENTRY(ip);
+	ENTRY(flags);
+	ENTRY(sp);
+	BLANK();
+#undef ENTRY
+
 #define ENTRY(entry) OFFSET(saved_context_ ## entry, saved_context, entry)
 	ENTRY(cr0);
 	ENTRY(cr2);
 	ENTRY(cr3);
 	ENTRY(cr4);
 	ENTRY(gdt_desc);
-	BLANK();
-#undef ENTRY
-
-#define ENTRY(entry) OFFSET(SEV_SNAPSHOT_CPU_CONTEXT_ ## entry, \
-			    sev_snapshot_cpu_context, entry)
-	ENTRY(kernel_regs_ptr);
-	ENTRY(restore_mailbox_va);
-	ENTRY(cr0);
-	ENTRY(cr3);
-	ENTRY(cr4);
-	ENTRY(efer);
-	ENTRY(idt);
 	BLANK();
 #undef ENTRY
 

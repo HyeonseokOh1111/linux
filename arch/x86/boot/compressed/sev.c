@@ -140,18 +140,13 @@ static void __page_state_change(unsigned long paddr, enum psc_op op)
 	 * If private -> shared then invalidate the page before requesting the
 	 * state change in the RMP table.
 	 */
-	if (op == SNP_PAGE_STATE_SHARED) {
-		if (pvalidate(paddr, RMP_PG_SIZE_4K, 0))
-			sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PVALIDATE);
-	}
+	if (op == SNP_PAGE_STATE_SHARED && pvalidate(paddr, RMP_PG_SIZE_4K, 0))
+		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PVALIDATE);
 
 
 	/* Issue VMGEXIT to change the page state in RMP table. */
 	sev_es_wr_ghcb_msr(GHCB_MSR_PSC_REQ_GFN(paddr >> PAGE_SHIFT, op));
-
 	VMGEXIT();
-
-
 
 	/* Read the response of the VMGEXIT. */
 	val = sev_es_rd_ghcb_msr();
@@ -162,10 +157,8 @@ static void __page_state_change(unsigned long paddr, enum psc_op op)
 	 * Now that page state is changed in the RMP table, validate it so that it is
 	 * consistent with the RMP entry.
 	 */
-	if (op == SNP_PAGE_STATE_PRIVATE) {
-		if (pvalidate(paddr, RMP_PG_SIZE_4K, 1))
-			sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PVALIDATE);
-	}
+	if (op == SNP_PAGE_STATE_PRIVATE && pvalidate(paddr, RMP_PG_SIZE_4K, 1))
+		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PVALIDATE);
 }
 
 void snp_set_page_private(unsigned long paddr)
@@ -327,6 +320,7 @@ invalid_page:
 				result = ES_EXCEPTION;
 			}
 			ctxt.insn.length = 0;
+
 			// for(int i = 0; i < lazy_valid_entry_count; i++){
 			// 	if(lazy_validated_addresses[i].addr + lazy_validated_addresses[i].size == fault_addr){
 			// 		lazy_validated_addresses[i].size = lazy_validated_addresses[i].size + PAGE_SIZE;

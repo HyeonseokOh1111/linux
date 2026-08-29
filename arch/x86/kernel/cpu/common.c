@@ -1796,23 +1796,6 @@ static void validate_apic_and_package_id(struct cpuinfo_x86 *c)
 #endif
 }
 
-static void snp_fixup_secondary_apic_id(struct cpuinfo_x86 *c)
-{
-#ifdef CONFIG_SMP
-	unsigned int apicid, cpu = smp_processor_id();
-
-	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP) || !cpu)
-		return;
-
-	apicid = apic->cpu_present_to_apicid(cpu);
-	if (apicid == BAD_APICID || apicid == c->apicid)
-		return;
-
-	c->initial_apicid = apicid;
-	c->apicid = apicid;
-#endif
-}
-
 /*
  * This does the hard work of actually picking apart the CPU stuff...
  */
@@ -1995,7 +1978,6 @@ void identify_secondary_cpu(struct cpuinfo_x86 *c)
 {
 	BUG_ON(c == &boot_cpu_data);
 	identify_cpu(c);
-	snp_fixup_secondary_apic_id(c);
 #ifdef CONFIG_X86_32
 	enable_sep_cpu();
 #endif
@@ -2173,15 +2155,12 @@ static inline void setup_getcpu(int cpu)
 	write_gdt_entry(get_cpu_gdt_rw(cpu), GDT_ENTRY_CPUNODE, &d, DESCTYPE_S);
 }
 
-static inline void setup_getcpu_msr(int cpu)
+void setup_getcpu_msr(int cpu)
 {
 	unsigned long cpudata = vdso_encode_cpunode(cpu, early_cpu_to_node(cpu));
 
-	if (boot_cpu_has(X86_FEATURE_RDTSCP) || boot_cpu_has(X86_FEATURE_RDPID)) {
-		if (cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
-			return;
+	if (boot_cpu_has(X86_FEATURE_RDTSCP) || boot_cpu_has(X86_FEATURE_RDPID))
 		wrmsr(MSR_TSC_AUX, cpudata, 0);
-	}
 }
 
 #ifdef CONFIG_X86_64
@@ -2253,12 +2232,6 @@ void cpu_init_exception_handling(void)
 
 	/* Finally load the IDT */
 	load_current_idt();
-
-	/*
-	 * Writing MSR_TSC_AUX can trigger a #VC under SNP. Do it only after the
-	 * runtime GHCB, TSS, and IDT are all live so the exception path is ready.
-	 */
-	setup_getcpu_msr(cpu);
 }
 
 /*
@@ -2334,6 +2307,11 @@ void cpu_init_secondary(void)
 	 * on this CPU in cpu_init_exception_handling().
 	 */
 	cpu_init_exception_handling();
+	/*
+	 * Intercepted MSRs require the runtime GHCB, TSS, and runtime #VC IDT
+	 * to be active on this AP.
+	 */
+	setup_getcpu_msr(raw_smp_processor_id());
 	cpu_init();
 }
 #endif

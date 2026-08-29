@@ -743,7 +743,7 @@ static void kvm_resume(void)
 #endif
 }
 
-void kvm_sev_snapshot_restore_reinit(void)
+static void kvm_sev_snapshot_restore_reinit_cpu(bool boot_cpu)
 {
 	unsigned long flags;
 
@@ -751,10 +751,15 @@ void kvm_sev_snapshot_restore_reinit(void)
 		return;
 
 	local_irq_save(flags);
-	if (x86_platform.restore_sched_clock_state)
-		x86_platform.restore_sched_clock_state();
+	if (boot_cpu) {
+		if (x86_platform.restore_sched_clock_state)
+			x86_platform.restore_sched_clock_state();
+	} else {
+		x86_cpuinit.early_percpu_clock_init();
+	}
 	kvm_guest_cpu_init();
-	pvclock_touch_watchdogs();
+	if (boot_cpu)
+		pvclock_touch_watchdogs();
 
 #ifdef CONFIG_ARCH_CPUIDLE_HALTPOLL
 	if (kvm_para_has_feature(KVM_FEATURE_POLL_CONTROL) && has_guest_poll)
@@ -763,23 +768,14 @@ void kvm_sev_snapshot_restore_reinit(void)
 	local_irq_restore(flags);
 }
 
+void kvm_sev_snapshot_restore_reinit(void)
+{
+	kvm_sev_snapshot_restore_reinit_cpu(true);
+}
+
 void kvm_sev_snapshot_restore_reinit_ap(void)
 {
-	unsigned long flags;
-
-	if (!kvm_para_available())
-		return;
-
-	local_irq_save(flags);
-	x86_cpuinit.early_percpu_clock_init();
-	kvm_guest_cpu_init();
-	pvclock_touch_watchdogs();
-
-#ifdef CONFIG_ARCH_CPUIDLE_HALTPOLL
-	if (kvm_para_has_feature(KVM_FEATURE_POLL_CONTROL) && has_guest_poll)
-		wrmsrl(MSR_KVM_POLL_CONTROL, 0);
-#endif
-	local_irq_restore(flags);
+	kvm_sev_snapshot_restore_reinit_cpu(false);
 }
 
 static struct syscore_ops kvm_syscore_ops = {

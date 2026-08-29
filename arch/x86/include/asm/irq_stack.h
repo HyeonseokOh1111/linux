@@ -135,8 +135,7 @@
 	 * User mode entry and interrupt on the irq stack do not	\
 	 * switch stacks. If from user mode the task stack is empty.	\
 	 */								\
-	if (user_mode(regs) || __this_cpu_read(pcpu_hot.hardirq_stack_inuse) || \
-	    !__this_cpu_read(pcpu_hot.hardirq_stack_ptr)) {		\
+	if (user_mode(regs) || __this_cpu_read(pcpu_hot.hardirq_stack_inuse)) { \
 		irq_enter_rcu();					\
 		func(c_args);						\
 		irq_exit_rcu();						\
@@ -213,13 +212,9 @@
  */
 #define do_softirq_own_stack()						\
 {									\
-	if (__this_cpu_read(pcpu_hot.hardirq_stack_ptr)) {		\
-		__this_cpu_write(pcpu_hot.hardirq_stack_inuse, true);	\
-		call_on_irqstack(__do_softirq, ASM_CALL_ARG0);		\
-		__this_cpu_write(pcpu_hot.hardirq_stack_inuse, false);	\
-	} else {							\
-		__do_softirq();						\
-	}								\
+	__this_cpu_write(pcpu_hot.hardirq_stack_inuse, true);		\
+	call_on_irqstack(__do_softirq, ASM_CALL_ARG0);			\
+	__this_cpu_write(pcpu_hot.hardirq_stack_inuse, false);		\
 }
 
 #endif

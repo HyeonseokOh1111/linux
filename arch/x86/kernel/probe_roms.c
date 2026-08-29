@@ -210,14 +210,9 @@ void __init probe_roms(void)
 	 * Do that here.
 	 */
 
-	//BCWH FIX THIS
-	// snp_prep_memory(0xe0000,
-	// 		0x100000,
-	// 		SNP_PAGE_STATE_SHARED);
-
-	// snp_prep_memory(video_rom_resource.start,
-	// 		((system_rom_resource.end + 1) - video_rom_resource.start),
-	// 		SNP_PAGE_STATE_PRIVATE);
+	snp_prep_memory(video_rom_resource.start,
+			((system_rom_resource.end + 1) - video_rom_resource.start),
+			SNP_PAGE_STATE_PRIVATE);
 
 	/* video rom */
 	upper = adapter_rom_resources[0].start;
@@ -283,4 +278,3 @@ void __init probe_roms(void)
 		start = adapter_rom_resources[i++].end & ~2047UL;
 	}
 }
-
