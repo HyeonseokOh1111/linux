@@ -27,12 +27,10 @@
 #include <asm/fixmap.h>
 #include <asm/setup.h>
 #include <asm/mem_encrypt.h>
-#include <asm/bootparam.h>
 #include <asm/set_memory.h>
 #include <asm/cacheflush.h>
 #include <asm/processor-flags.h>
 #include <asm/msr.h>
-#include <asm/cmdline.h>
 #include <asm/sev.h>
 
 #include "mm_internal.h"
@@ -47,49 +45,10 @@ u64 sev_status __section(".data") = 0;
 u64 sev_check_data __section(".data") = 0;
 EXPORT_SYMBOL(sme_me_mask);
 
+extern char __init_scratch_begin[], __init_scratch_end[];
+
 /* Buffer used for early in-place encryption by BSP, no locking needed */
 static char sme_early_buffer[PAGE_SIZE] __initdata __aligned(PAGE_SIZE);
-
-static bool __init faasev_cmdline_requests_vmpl(const char *cmdline)
-{
-	char value[2] = {};
-	int len;
-
-	if (!cmdline)
-		return false;
-
-	len = cmdline_find_option(cmdline, "faasev_vmpl", value, sizeof(value));
-	if (len >= 0)
-		return len == 0 || value[0] == '1';
-
-	return cmdline_find_option_bool(cmdline, "faasev_vmpl") > 0;
-}
-
-static const char *__init faasev_boot_params_cmdline(const struct boot_params *bp)
-{
-	unsigned long cmdline_paddr;
-
-	if (!bp)
-		return NULL;
-
-	cmdline_paddr = bp->hdr.cmd_line_ptr;
-	cmdline_paddr |= (u64)bp->ext_cmd_line_ptr << 32;
-	if (!cmdline_paddr)
-		return NULL;
-
-	return __va(cmdline_paddr);
-}
-
-static bool __init faasev_vmpl_boot(void)
-{
-	if (faasev_vmpl_boot_early)
-		return true;
-
-	if (faasev_cmdline_requests_vmpl(boot_command_line))
-		return true;
-
-	return faasev_cmdline_requests_vmpl(faasev_boot_params_cmdline(&boot_params));
-}
 
 /*
  * SNP-specific routine which needs to additionally change the page state from
@@ -173,7 +132,7 @@ static void __init __sme_early_enc_dec(resource_size_t paddr,
 		 * avoid data corruption as documented in the APM.
 		 */
 		if (cc_platform_has(CC_ATTR_GUEST_SEV_SNP)) {
-			bool vmpl_boot = faasev_vmpl_boot();
+			bool vmpl_boot = faasev_vmpl_boot_early;
 
 			snp_memcpy(sme_early_buffer, src, len, paddr, enc,
 				   enc || !vmpl_boot);
@@ -553,21 +512,26 @@ void __init sme_early_init(void)
 
 void __init mem_encrypt_free_decrypted_mem(void)
 {
-	unsigned long vaddr, vaddr_end, npages;
+	unsigned long paddr, paddr_end, vaddr, vaddr_end, npages;
+	bool vmpl_boot = faasev_vmpl_boot_early;
 	int r;
+
+	/* .init.scratch is outside the kernel reserve but remains decrypted. */
+	if (sme_me_mask && vmpl_boot) {
+		paddr = ALIGN_DOWN(__pa_symbol(__init_scratch_begin), PAGE_SIZE);
+		paddr_end = PAGE_ALIGN(__pa_symbol(__init_scratch_end));
+		npages = (paddr_end - paddr) >> PAGE_SHIFT;
+		sev_snapshot_prepare_private_pages_pa(paddr, npages);
+		r = set_memory_encrypted((unsigned long)__va(paddr), npages);
+		if (r) {
+			pr_warn("failed to make init scratch private\n");
+			return;
+		}
+	}
 
 	vaddr = (unsigned long)__start_bss_decrypted_unused;
 	vaddr_end = (unsigned long)__end_bss_decrypted;
 	npages = (vaddr_end - vaddr) >> PAGE_SHIFT;
-
-	/*
-	 * Lower-VMPL Linux cannot execute the PVALIDATE step required after a
-	 * shared->private PSC transition.  Keep the small unused decrypted tail
-	 * reserved for now instead of converting it back to private and faulting
-	 * on the first free_init_pages() poison write.
-	 */
-	if (faasev_vmpl_boot())
-		return;
 
 	/*
 	 * If the unused memory range was mapped decrypted, change the encryption
@@ -578,6 +542,8 @@ void __init mem_encrypt_free_decrypted_mem(void)
 	 * using vTOM, where sme_me_mask is always zero.
 	 */
 	if (sme_me_mask) {
+		if (vmpl_boot)
+			sev_snapshot_prepare_private_pages_pa(__pa(vaddr), npages);
 		r = set_memory_encrypted(vaddr, npages);
 		if (r) {
 			pr_warn("failed to free unused decrypted pages\n");

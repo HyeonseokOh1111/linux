@@ -36,7 +36,8 @@ struct scatterlist;
 
 unsigned long swiotlb_size_or_default(void);
 void __init swiotlb_init_remap(bool addressing_limit, unsigned int flags,
-	int (*remap)(void *tlb, unsigned long nslabs));
+	int (*remap)(void *tlb, unsigned long nslabs),
+	void (*prepare)(void *ptr, size_t bytes));
 int swiotlb_init_late(size_t size, gfp_t gfp_mask,
 	int (*remap)(void *tlb, unsigned long nslabs));
 extern void __init swiotlb_update_mem_attributes(void);

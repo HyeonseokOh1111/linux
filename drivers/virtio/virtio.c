@@ -578,7 +578,7 @@ int virtio_sev_snapshot_freeze_devices(void)
 }
 EXPORT_SYMBOL_GPL(virtio_sev_snapshot_freeze_devices);
 
-static int virtio_sev_snapshot_restore_one(struct device *dev, void *data)
+static int virtio_sev_snapshot_faasev_one(struct device *dev, void *data)
 {
 	struct virtio_device *vdev = dev_to_virtio(dev);
 	struct virtio_driver *drv;
@@ -595,15 +595,15 @@ static int virtio_sev_snapshot_restore_one(struct device *dev, void *data)
 	return 0;
 }
 
-int virtio_sev_snapshot_restore_devices(void)
+int virtio_sev_snapshot_faasev_devices(void)
 {
 	int ret = 0;
 
 	bus_for_each_dev(&virtio_bus, NULL, &ret,
-			 virtio_sev_snapshot_restore_one);
+			 virtio_sev_snapshot_faasev_one);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(virtio_sev_snapshot_restore_devices);
+EXPORT_SYMBOL_GPL(virtio_sev_snapshot_faasev_devices);
 
 static int virtio_init(void)
 {

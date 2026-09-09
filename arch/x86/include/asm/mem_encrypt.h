@@ -18,8 +18,6 @@
 
 #include <asm/bootparam.h>
 
-struct pt_regs;
-
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 
 extern u64 sme_me_mask;

@@ -10,12 +10,10 @@
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/hrtimer.h>
-#include <linux/dma-direct.h>
 #include <linux/dma-mapping.h>
 #include <linux/kmsan.h>
 #include <linux/spinlock.h>
 #include <xen/xen.h>
-#include <asm/sev.h>
 
 #ifdef DEBUG
 /* For development, we want to crash whenever the ring is screwed. */
@@ -306,14 +304,11 @@ static void *vring_alloc_queue(struct virtio_device *vdev, size_t size,
 			       dma_addr_t *dma_handle, gfp_t flag,
 			       struct device *dma_dev)
 {
-	void *queue;
-	phys_addr_t phys_addr;
-	unsigned int npages;
-
 	if (vring_use_dma_api(vdev)) {
-		queue = dma_alloc_coherent(dma_dev, size, dma_handle, flag);
+		return dma_alloc_coherent(dma_dev, size,
+					  dma_handle, flag);
 	} else {
-		queue = alloc_pages_exact(PAGE_ALIGN(size), flag);
+		void *queue = alloc_pages_exact(PAGE_ALIGN(size), flag);
 
 		if (queue) {
 			phys_addr_t phys_addr = virt_to_phys(queue);
@@ -335,28 +330,14 @@ static void *vring_alloc_queue(struct virtio_device *vdev, size_t size,
 				return NULL;
 			}
 		}
+		return queue;
 	}
-
-	if (queue) {
-		phys_addr = dma_to_phys(dma_dev, *dma_handle);
-		npages = PAGE_ALIGN(size) >> PAGE_SHIFT;
-		sev_snapshot_track_page_state_pa((unsigned long)phys_addr, npages,
-						 SNP_PAGE_STATE_SHARED);
-	}
-
-	return queue;
 }
 
 static void vring_free_queue(struct virtio_device *vdev, size_t size,
 			     void *queue, dma_addr_t dma_handle,
 			     struct device *dma_dev)
 {
-	phys_addr_t phys_addr = dma_to_phys(dma_dev, dma_handle);
-	unsigned int npages = PAGE_ALIGN(size) >> PAGE_SHIFT;
-
-	sev_snapshot_track_page_state_pa((unsigned long)phys_addr, npages,
-					 SNP_PAGE_STATE_PRIVATE);
-
 	if (vring_use_dma_api(vdev))
 		dma_free_coherent(dma_dev, size, queue, dma_handle);
 	else

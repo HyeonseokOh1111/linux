@@ -1409,8 +1409,6 @@ static int virtblk_probe(struct virtio_device *vdev)
 	vblk->disk->private_data = vblk;
 	vblk->disk->fops = &virtblk_fops;
 	vblk->index = index;
-	/* This environment mounts the whole-disk rootfs (/dev/vda) directly. */
-	vblk->disk->flags |= GENHD_FL_NO_PART;
 
 	/* configure queue flush support */
 	virtblk_update_cache_mode(vdev);

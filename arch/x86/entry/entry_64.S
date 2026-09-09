@@ -202,7 +202,7 @@ syscall_return_via_sysret:
 	/*
 	 * Now all regs are restored except RSP and RDI.
 	 * Save old stack pointer and switch to trampoline stack.
-	*/
+	 */
 	movq	%rsp, %rdi
 	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp0), %rsp
 	UNWIND_HINT_END_OF_STACK
@@ -667,6 +667,7 @@ SYM_INNER_LABEL(swapgs_restore_regs_and_return_to_usermode, SYM_L_GLOBAL)
 	popq	%rdi
 	swapgs
 	jmp	.Lnative_iret
+
 
 SYM_INNER_LABEL(restore_regs_and_return_to_kernel, SYM_L_GLOBAL)
 #ifdef CONFIG_DEBUG_ENTRY

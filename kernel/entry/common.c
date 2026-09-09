@@ -10,8 +10,6 @@
 #include <linux/audit.h>
 #include <linux/tick.h>
 
-#include <asm/mem_encrypt.h>
-
 #include "common.h"
 
 #define CREATE_TRACE_POINTS

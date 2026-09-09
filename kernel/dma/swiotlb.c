@@ -275,7 +275,8 @@ static void swiotlb_init_io_tlb_mem(struct io_tlb_mem *mem, phys_addr_t start,
 
 static void __init *swiotlb_memblock_alloc(unsigned long nslabs,
 		unsigned int flags,
-		int (*remap)(void *tlb, unsigned long nslabs))
+		int (*remap)(void *tlb, unsigned long nslabs),
+		void (*prepare)(void *ptr, size_t bytes))
 {
 	size_t bytes = PAGE_ALIGN(nslabs << IO_TLB_SHIFT);
 	phys_addr_t alignment = swiotlb_hugepages ? SZ_2M : PAGE_SIZE;
@@ -287,9 +288,11 @@ static void __init *swiotlb_memblock_alloc(unsigned long nslabs,
 	 * memory encryption.
 	 */
 	if (flags & SWIOTLB_ANY)
-		tlb = memblock_alloc(bytes, alignment);
+		tlb = memblock_alloc_raw(bytes, alignment);
 	else
-		tlb = memblock_alloc_low(bytes, alignment);
+		tlb = memblock_alloc_try_nid_raw(bytes, alignment,
+			MEMBLOCK_LOW_LIMIT, ARCH_LOW_ADDRESS_LIMIT,
+			NUMA_NO_NODE);
 
 	if (!tlb) {
 		pr_warn("%s: Failed to allocate %zu bytes tlb structure\n",
@@ -297,13 +300,32 @@ static void __init *swiotlb_memblock_alloc(unsigned long nslabs,
 		return NULL;
 	}
 
+	if (prepare)
+		prepare(tlb, bytes);
 	if (remap && remap(tlb, nslabs) < 0) {
 		memblock_free(tlb, PAGE_ALIGN(bytes));
 		pr_warn("%s: Failed to remap %zu bytes\n", __func__, bytes);
 		return NULL;
 	}
+	memset(tlb, 0, bytes);
 
 	return tlb;
+}
+
+static void *__init swiotlb_memblock_alloc_metadata(size_t bytes,
+		unsigned long align, void (*prepare)(void *ptr, size_t bytes))
+{
+	size_t alloc_bytes = prepare ? PAGE_ALIGN(bytes) : bytes;
+	unsigned long alloc_align = prepare ?
+		max_t(unsigned long, align, PAGE_SIZE) : align;
+	void *ptr = memblock_alloc_raw(alloc_bytes, alloc_align);
+
+	if (!ptr)
+		return NULL;
+	if (prepare)
+		prepare(ptr, alloc_bytes);
+	memset(ptr, 0, alloc_bytes);
+	return ptr;
 }
 
 /*
@@ -311,7 +333,8 @@ static void __init *swiotlb_memblock_alloc(unsigned long nslabs,
  * structures for the software IO TLB used to implement the DMA API.
  */
 void __init swiotlb_init_remap(bool addressing_limit, unsigned int flags,
-		int (*remap)(void *tlb, unsigned long nslabs))
+		int (*remap)(void *tlb, unsigned long nslabs),
+		void (*prepare)(void *ptr, size_t bytes))
 {
 	struct io_tlb_mem *mem = &io_tlb_default_mem;
 	unsigned long nslabs;
@@ -331,7 +354,7 @@ void __init swiotlb_init_remap(bool addressing_limit, unsigned int flags,
 		swiotlb_adjust_nareas(num_possible_cpus());
 
 	nslabs = default_nslabs;
-	while ((tlb = swiotlb_memblock_alloc(nslabs, flags, remap)) == NULL) {
+	while ((tlb = swiotlb_memblock_alloc(nslabs, flags, remap, prepare)) == NULL) {
 		if (nslabs <= IO_TLB_MIN_SLABS)
 			return;
 		nslabs = ALIGN(nslabs >> 1, IO_TLB_SEGSIZE);
@@ -344,15 +367,17 @@ void __init swiotlb_init_remap(bool addressing_limit, unsigned int flags,
 	}
 
 	alloc_size = PAGE_ALIGN(array_size(sizeof(*mem->slots), nslabs));
-	mem->slots = memblock_alloc(alloc_size, PAGE_SIZE);
+	mem->slots = swiotlb_memblock_alloc_metadata(alloc_size, PAGE_SIZE,
+						     prepare);
 	if (!mem->slots) {
 		pr_warn("%s: Failed to allocate %zu bytes align=0x%lx\n",
 			__func__, alloc_size, PAGE_SIZE);
 		return;
 	}
 
-	mem->areas = memblock_alloc(array_size(sizeof(struct io_tlb_area),
-		default_nareas), SMP_CACHE_BYTES);
+	alloc_size = array_size(sizeof(struct io_tlb_area), default_nareas);
+	mem->areas = swiotlb_memblock_alloc_metadata(alloc_size,
+						     SMP_CACHE_BYTES, prepare);
 	if (!mem->areas) {
 		pr_warn("%s: Failed to allocate mem->areas.\n", __func__);
 		return;
@@ -367,7 +392,7 @@ void __init swiotlb_init_remap(bool addressing_limit, unsigned int flags,
 
 void __init swiotlb_init(bool addressing_limit, unsigned int flags)
 {
-	swiotlb_init_remap(addressing_limit, flags, NULL);
+	swiotlb_init_remap(addressing_limit, flags, NULL, NULL);
 }
 
 /*

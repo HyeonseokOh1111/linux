@@ -85,6 +85,7 @@ extern bool handle_vc_boot_ghcb(struct pt_regs *regs);
 
 /* RMP page size */
 #define RMP_PG_SIZE_4K			0
+#define RMP_PG_SIZE_2M			1
 
 #define RMPADJUST_VMSA_PAGE_BIT		BIT(16)
 
@@ -199,14 +200,16 @@ void __init early_snp_set_memory_shared(unsigned long vaddr, unsigned long paddr
 void __init snp_prep_memory(unsigned long paddr, unsigned int sz, enum psc_op op);
 void snp_set_memory_shared(unsigned long vaddr, unsigned int npages);
 void snp_set_memory_private(unsigned long vaddr, unsigned int npages);
-void sev_snapshot_track_page_state_pa(unsigned long paddr, unsigned int npages,
-				      enum psc_op op);
+void sev_snapshot_notify_page_state_pa(unsigned long paddr, unsigned int npages,
+				       enum psc_op op);
+void sev_snapshot_prepare_private_pages_pa(unsigned long paddr,
+					   unsigned int npages);
 void snp_set_wakeup_secondary_cpu(void);
 bool snp_init(struct boot_params *bp);
 void __init __noreturn snp_abort(void);
 int snp_issue_guest_request(u64 exit_code, struct snp_req_data *input, struct snp_guest_request_ioctl *rio);
-bool sev_snapshot_negotiate_runtime_ghcb_protocol(void);
-void sev_snapshot_reset_offline_ghcb_state(void);
+int sev_snapshot_prepare_input_crypto(void);
+int sev_snapshot_install_input_private_key(void);
 #else
 static inline void sev_es_ist_enter(struct pt_regs *regs) { }
 static inline void sev_es_ist_exit(void) { }
@@ -223,9 +226,11 @@ early_snp_set_memory_shared(unsigned long vaddr, unsigned long paddr, unsigned i
 static inline void __init snp_prep_memory(unsigned long paddr, unsigned int sz, enum psc_op op) { }
 static inline void snp_set_memory_shared(unsigned long vaddr, unsigned int npages) { }
 static inline void snp_set_memory_private(unsigned long vaddr, unsigned int npages) { }
-static inline void sev_snapshot_track_page_state_pa(unsigned long paddr,
-						    unsigned int npages,
-						    enum psc_op op) { }
+static inline void sev_snapshot_notify_page_state_pa(unsigned long paddr,
+						     unsigned int npages,
+						     enum psc_op op) { }
+static inline void sev_snapshot_prepare_private_pages_pa(unsigned long paddr,
+							 unsigned int npages) { }
 static inline void snp_set_wakeup_secondary_cpu(void) { }
 static inline bool snp_init(struct boot_params *bp) { return false; }
 static inline void snp_abort(void) { }
@@ -233,8 +238,8 @@ static inline int snp_issue_guest_request(u64 exit_code, struct snp_req_data *in
 {
 	return -ENOTTY;
 }
-static inline bool sev_snapshot_negotiate_runtime_ghcb_protocol(void) { return false; }
-static inline void sev_snapshot_reset_offline_ghcb_state(void) { }
+static inline int sev_snapshot_install_input_private_key(void) { return -ENOTTY; }
+static inline int sev_snapshot_prepare_input_crypto(void) { return -ENOTTY; }
 #endif
 
 #endif

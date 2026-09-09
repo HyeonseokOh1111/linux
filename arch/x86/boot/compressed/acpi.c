@@ -161,7 +161,7 @@ acpi_physical_address get_rsdp_addr(void)
 	if (!pa)
 		pa = efi_get_rsdp_addr();
 
-	if (!pa)
+	if (!pa && !faasev_vmpl_requested())
 		pa = bios_get_rsdp_addr();
 
 	return pa;

@@ -191,7 +191,7 @@ static inline struct virtio_driver *drv_to_virtio(struct device_driver *drv)
 int register_virtio_driver(struct virtio_driver *drv);
 void unregister_virtio_driver(struct virtio_driver *drv);
 int virtio_sev_snapshot_freeze_devices(void);
-int virtio_sev_snapshot_restore_devices(void);
+int virtio_sev_snapshot_faasev_devices(void);
 
 /* module_virtio_driver() - Helper macro for drivers that don't do
  * anything special in module init/exit.  This eliminates a lot of

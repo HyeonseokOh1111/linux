@@ -110,6 +110,7 @@ static void __init setup_real_mode(void)
 	 */
 	if (cc_platform_has(CC_ATTR_HOST_MEM_ENCRYPT))
 		set_memory_decrypted((unsigned long)base, size >> PAGE_SHIFT);
+	sev_snapshot_prepare_private_pages_pa(__pa(base), size >> PAGE_SHIFT);
 
 	memcpy(base, real_mode_blob, size);
 

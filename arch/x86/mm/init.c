@@ -28,6 +28,7 @@
 #include <asm/text-patching.h>
 #include <asm/memtype.h>
 #include <asm/paravirt.h>
+#include <asm/sev.h>
 
 /*
  * We need to define the tracepoints somewhere, and tlb.c
@@ -125,31 +126,33 @@ static bool __initdata can_use_brk_pgt = true;
 __ref void *alloc_low_pages(unsigned int num)
 {
 	unsigned long pfn;
-	phys_addr_t saved_limit = 0;
 	int i;
 
 	if (after_bootmem) {
 		unsigned int order;
 
 		order = get_order((unsigned long)num << PAGE_SHIFT);
-		pfn = __get_free_pages(GFP_ATOMIC | __GFP_ZERO, order);
-		return (void *)pfn;
+		return (void *)__get_free_pages(GFP_ATOMIC | __GFP_ZERO, order);
 	}
 
 	if ((pgt_buf_end + num) > pgt_buf_top || !can_use_brk_pgt) {
 		unsigned long ret = 0;
 
 		if (min_pfn_mapped < max_pfn_mapped) {
-			phys_addr_t alloc_end = max_pfn_mapped << PAGE_SHIFT;
+			phys_addr_t saved_limit = 0;
+			phys_addr_t alloc_end = 0;
 
-			saved_limit = memblock_get_current_limit();
-			if (alloc_end > saved_limit)
-				memblock_set_current_limit(alloc_end);
+			if (faasev_vmpl_boot_early) {
+				alloc_end = max_pfn_mapped << PAGE_SHIFT;
+				saved_limit = memblock_get_current_limit();
+				if (alloc_end > saved_limit)
+					memblock_set_current_limit(alloc_end);
+			}
 			ret = memblock_phys_alloc_range(
 					PAGE_SIZE * num, PAGE_SIZE,
 					min_pfn_mapped << PAGE_SHIFT,
 					max_pfn_mapped << PAGE_SHIFT);
-			if (alloc_end > saved_limit)
+			if (faasev_vmpl_boot_early && alloc_end > saved_limit)
 				memblock_set_current_limit(saved_limit);
 		}
 
@@ -565,7 +568,7 @@ unsigned long __ref init_memory_mapping(unsigned long start,
 	memset(mr, 0, sizeof(mr));
 	nr_range = split_mem_range(mr, 0, start, end);
 
-	if (!after_bootmem && !memblock_bottom_up()) {
+	if (faasev_vmpl_boot_early && !after_bootmem && !memblock_bottom_up()) {
 		for (i = nr_range - 1; i >= 0; i--) {
 			ret = kernel_physical_mapping_init(mr[i].start, mr[i].end,
 							   mr[i].page_size_mask,
@@ -692,6 +695,7 @@ static void __init memory_map_top_down(unsigned long map_start,
 {
 	unsigned long real_end, last_start;
 	unsigned long step_size;
+	unsigned long addr;
 	unsigned long mapped_ram_size = 0;
 
 	/*
@@ -702,7 +706,14 @@ static void __init memory_map_top_down(unsigned long map_start,
 	 * there is enough mapped memory that can be allocated from
 	 * memblock.
 	 */
-	real_end = find_top_down_anchor_end(map_start, map_end);
+	if (faasev_vmpl_boot_early) {
+		real_end = find_top_down_anchor_end(map_start, map_end);
+	} else {
+		addr = memblock_phys_alloc_range(PMD_SIZE, PMD_SIZE, map_start,
+						 map_end);
+		memblock_phys_free(addr, PMD_SIZE);
+		real_end = addr + PMD_SIZE;
+	}
 	if (!real_end) {
 		unsigned long kernel_end = clamp_val(__pa_symbol(_end), map_start, map_end);
 		unsigned long pgt_start = clamp_val((unsigned long)pgt_buf_start << PAGE_SHIFT,

@@ -128,16 +128,34 @@ static inline bool sev_snp_enabled(void)
 	return sev_status & MSR_AMD64_SEV_SNP_ENABLED;
 }
 
-static bool faasev_vmpl_requested(void)
+/* Preserve the once-per-compressed-stage decision across the decompressor's BSS clear. */
+static bool faasev_vmpl_boot __section(".data");
+
+bool faasev_vmpl_requested(void)
 {
-	char arg[4];
-	int len;
+	return faasev_vmpl_boot;
+}
 
-	len = cmdline_find_option("faasev_vmpl", arg, sizeof(arg));
-	if (len < 0)
-		return false;
+void faasev_prepare_private_pages(unsigned long paddr, unsigned long npages)
+{
+	const u64 request = 0xf500000000000014ULL | (3ULL << 52);
+	struct msr saved;
 
-	return len == 0 || arg[0] == '1';
+	if (!faasev_vmpl_requested() || !npages)
+		return;
+
+	boot_rdmsr(MSR_AMD64_SEV_ES_GHCB, &saved);
+	while (npages) {
+		u64 chunk = min(npages, 256UL);
+		u64 notify = request | ((chunk - 1) << 44) |
+				     ((paddr >> PAGE_SHIFT) << PAGE_SHIFT);
+
+		sev_es_wr_ghcb_msr(notify);
+		VMGEXIT();
+		paddr += chunk << PAGE_SHIFT;
+		npages -= chunk;
+	}
+	sev_es_wr_ghcb_msr(saved.q);
 }
 
 static void __page_state_change(unsigned long paddr, enum psc_op op)
@@ -153,7 +171,7 @@ static void __page_state_change(unsigned long paddr, enum psc_op op)
 	 * those grants before the main kernel can install VMPL0-mediated page
 	 * state tracking.
 	 */
-	if (op == SNP_PAGE_STATE_PRIVATE && faasev_vmpl_requested())
+	if (faasev_vmpl_requested())
 		return;
 
 	/*
@@ -458,8 +476,18 @@ void snp_check_features(void)
 void sev_enable(struct boot_params *bp)
 {
 	unsigned int eax, ebx, ecx, edx;
+	unsigned long cmdline_ptr;
+	char vmpl_arg[4];
 	struct msr m;
+	int vmpl_len;
 	bool snp;
+
+	cmdline_ptr = bp->hdr.cmd_line_ptr;
+	cmdline_ptr |= (u64)bp->ext_cmd_line_ptr << 32;
+	vmpl_len = __cmdline_find_option(cmdline_ptr, "faasev_vmpl",
+					 vmpl_arg, sizeof(vmpl_arg));
+	faasev_vmpl_boot = vmpl_len >= 0 &&
+		(vmpl_len == 0 || vmpl_arg[0] == '1');
 
 	/*
 	 * bp->cc_blob_address should only be set by boot/compressed kernel.
@@ -520,7 +548,8 @@ void sev_enable(struct boot_params *bp)
 		if (!(get_hv_features() & GHCB_HV_FT_SNP))
 			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
 
-		enforce_vmpl0();
+		if (!faasev_vmpl_requested())
+			enforce_vmpl0();
 	}
 
 	if (snp && !(sev_status & MSR_AMD64_SEV_SNP_ENABLED))

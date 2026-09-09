@@ -13,6 +13,7 @@
 #include <asm/dma.h>
 #include <asm/iommu.h>
 #include <asm/gart.h>
+#include <asm/sev.h>
 #include <asm/x86_init.h>
 
 #include <xen/xen.h>
@@ -40,6 +41,15 @@ int iommu_detected __read_mostly = 0;
 #ifdef CONFIG_SWIOTLB
 bool x86_swiotlb_enable;
 static unsigned int x86_swiotlb_flags;
+
+static void __init x86_swiotlb_prepare(void *ptr, size_t bytes)
+{
+	unsigned long paddr = __pa(ptr);
+	unsigned long start = paddr & PAGE_MASK;
+
+	sev_snapshot_prepare_private_pages_pa(start,
+				DIV_ROUND_UP(paddr - start + bytes, PAGE_SIZE));
+}
 
 static void __init pci_swiotlb_detect(void)
 {
@@ -78,7 +88,8 @@ static void __init pci_xen_swiotlb_init(void)
 		return;
 	x86_swiotlb_enable = true;
 	x86_swiotlb_flags |= SWIOTLB_ANY;
-	swiotlb_init_remap(true, x86_swiotlb_flags, xen_swiotlb_fixup);
+	swiotlb_init_remap(true, x86_swiotlb_flags, xen_swiotlb_fixup,
+			    x86_swiotlb_prepare);
 	dma_ops = &xen_swiotlb_dma_ops;
 	if (IS_ENABLED(CONFIG_PCI))
 		pci_request_acs();
@@ -120,7 +131,8 @@ void __init pci_iommu_alloc(void)
 	gart_iommu_hole_init();
 	amd_iommu_detect();
 	detect_intel_iommu();
-	swiotlb_init(x86_swiotlb_enable, x86_swiotlb_flags);
+	swiotlb_init_remap(x86_swiotlb_enable, x86_swiotlb_flags, NULL,
+			    x86_swiotlb_prepare);
 }
 
 /*

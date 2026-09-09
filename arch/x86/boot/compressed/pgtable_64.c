@@ -133,6 +133,8 @@ struct paging_config paging_prepare(void *rmode)
 	}
 
 	paging_config.trampoline_start = find_trampoline_placement();
+	faasev_prepare_private_pages(paging_config.trampoline_start,
+				     TRAMPOLINE_32BIT_SIZE >> PAGE_SHIFT);
 
 	trampoline_32bit = (unsigned long *)paging_config.trampoline_start;
 

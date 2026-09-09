@@ -88,6 +88,8 @@ static inline void debug_puthex(unsigned long value)
 #endif
 
 /* cmdline.c */
+int __cmdline_find_option(unsigned long cmdline_ptr, const char *option,
+			  char *buffer, int bufsize);
 int cmdline_find_option(const char *option, char *buffer, int bufsize);
 int cmdline_find_option_bool(const char *option);
 
@@ -134,6 +136,8 @@ static inline void console_init(void)
 #endif
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
+bool faasev_vmpl_requested(void);
+void faasev_prepare_private_pages(unsigned long paddr, unsigned long npages);
 void sev_enable(struct boot_params *bp);
 void snp_check_features(void);
 void sev_es_shutdown_ghcb(void);
@@ -143,6 +147,9 @@ void snp_set_page_private(unsigned long paddr);
 void snp_set_page_shared(unsigned long paddr);
 void sev_prep_identity_maps(unsigned long top_level_pgt);
 #else
+static inline bool faasev_vmpl_requested(void) { return false; }
+static inline void faasev_prepare_private_pages(unsigned long paddr,
+						 unsigned long npages) { }
 static inline void sev_enable(struct boot_params *bp)
 {
 	/*
