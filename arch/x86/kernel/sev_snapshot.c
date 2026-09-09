@@ -691,6 +691,23 @@ sev_snapshot_restore_barrier(void *mailbox, u32 cpu_count)
 		((u8 *)mailbox + sev_snapshot_restore_barrier_offset(cpu_count));
 }
 
+static void sev_snapshot_finish_bsp_restore(void)
+{
+	u32 restore_cpu_count = sev_snapshot_restore_cpu_count();
+	void *mailbox = sev_snapshot_restore_mailbox_va();
+
+	if (sev_snapshot_install_input_private_key())
+		sev_snapshot_restore_fault();
+
+	if (restore_cpu_count > SEV_SNAPSHOT_MIN_CPUS) {
+		struct sev_snapshot_restore_barrier *restore_barrier;
+
+		restore_barrier = sev_snapshot_restore_barrier(mailbox,
+							 restore_cpu_count);
+		atomic_set_release((atomic_t *)&restore_barrier->resume, 1);
+	}
+}
+
 static u32 *sev_snapshot_shared_extent_count_ptr(void *mailbox, u32 cpu_count)
 {
 	struct sev_snapshot_shared_extent_header *header;
@@ -1049,6 +1066,7 @@ long sev_snapshot_arm(void)
 restore_continue:
 	local_irq_restore(flags);
 	preempt_enable_no_resched();
+	sev_snapshot_finish_bsp_restore();
 	return sev_snapshot_restore_current_affinity();
 
 out_enable:
@@ -1314,8 +1332,11 @@ static void sev_snapshot_restore_rendezvous(void *mailbox,
 	if (sev_snapshot_restore_virtio_devices())
 		sev_snapshot_restore_fault();
 
-	if (restore_barrier)
-		atomic_set_release((atomic_t *)&restore_barrier->resume, 1);
+	/*
+	 * The restored BSP publishes resume only after its saved continuation has
+	 * restored IRQ/preemption state and installed the global input key.  APs
+	 * remain interruptible here so device-restore callbacks can complete.
+	 */
 }
 
 static void __noreturn sev_snapshot_resume_saved_continuation(

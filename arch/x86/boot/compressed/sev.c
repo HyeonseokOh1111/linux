@@ -313,6 +313,7 @@ invalid_page:
 		if(sev_snp_enabled()){
 			//if some memory is accessed that needs to be validated, do it lazily
 			//faulting address is stored in cr2
+			result = ES_OK;
 			asm volatile("movq %%cr2, %[some]"
 				: [some] "=r" (fault_addr)
 			);

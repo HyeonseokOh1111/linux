@@ -204,6 +204,7 @@ bool snp_init(struct boot_params *bp);
 void __init __noreturn snp_abort(void);
 int snp_issue_guest_request(u64 exit_code, struct snp_req_data *input, struct snp_guest_request_ioctl *rio);
 int sev_snapshot_prepare_shadow_crypto(void);
+int sev_snapshot_install_input_private_key(void);
 #else
 static inline void sev_es_ist_enter(struct pt_regs *regs) { }
 static inline void sev_es_ist_exit(void) { }
@@ -229,6 +230,7 @@ static inline int snp_issue_guest_request(u64 exit_code, struct snp_req_data *in
 	return -ENOTTY;
 }
 static inline int sev_snapshot_prepare_shadow_crypto(void) { return -ENOTTY; }
+static inline int sev_snapshot_install_input_private_key(void) { return -ENOTTY; }
 #endif
 
 #endif

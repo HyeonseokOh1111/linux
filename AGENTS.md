@@ -35,23 +35,23 @@
 - Snapshot Restorer는 private mailbox에 verified CPU bundle과 shared immutable landing page 한 장을 설치한 뒤 guest-visible BSP/AP vCPU를 Linux restore entry로 handoff한다. Landing은 저장된 kernel continuation stack pointer 아래의 scratch 영역을 Linux C handoff stack으로 사용한다. BSP와 AP capture는 Restorer와 같은 `SP - 0x800`, 16-byte alignment 및 8-byte sentinel 산식의 최종 RSP가 current task stack의 usable 범위 안인지 확인한 뒤에만 context bundle을 publish한다. Linux는 restored TSS, runtime #VC IDT와 GHCB를 활성화하고 나머지 runtime/device restore를 수행하며, 저장된 hardirq stack은 normal interrupt entry가 사용하도록 pointer와 in-use state만 복구한다.
 - Linux는 launch/control path가 제공한 CPU 수로 raw bundle의 fixed offsets를 계산하고 자신의 CPU index에 해당하는 context를 선택한다. 제거한 header, topology 또는 validity flags를 다른 이름으로 재도입하지 않는다.
 - Restore는 GDT/TR, standard current IDT, control/base registers와 XCR0/XSAVE/PKRU를 복구한다. FS/GS 복구 뒤 `setup_ghcb_for_snapshot_restore()`가 authenticated snapshot의 negotiated protocol version을 재사용하고, fresh Template launch의 per-CPU runtime GHCB page를 MSR PSC로 shared 전환한 뒤 등록한다. 그 다음 runtime #VC IDT를 활성화하고 표준 KVM/PV clock, local APIC과 `tick_resume_local()`을 재사용해 BSP/AP 공통 kernel continuation resume 하나로 이어진다. Direct user-mode restore와 return-mode 분기는 없다. CR4는 Restorer landing에서 설치하고 Linux restore entry가 다시 쓰지 않는다.
-- 각 CPU가 CPU-local 복구 뒤 `arrived`를 publish한다. BSP는 모든 AP를 기다린 뒤 virtio/BSP-global state를 복구하고 `resume`을 publish한다. Input private key는 BSP continuation에서 설치하지 않으며, 수동 local-APIC timer programming은 사용하지 않고 `tick_resume_local()`을 canonical 경로로 사용한다.
+- 각 CPU가 CPU-local 복구 뒤 `arrived`를 publish한다. BSP는 모든 AP를 기다린 뒤 virtio/BSP-global state를 복구하고 saved continuation으로 돌아가 IRQ/preemption을 복원한 다음 input private key를 설치한 뒤 `resume`을 publish한다. 수동 local-APIC timer programming은 사용하지 않고 `tick_resume_local()`을 canonical 경로로 사용한다.
 - Multi-vCPU restore barrier는 `arrived`와 `resume` 두 field만 사용한다. AP-local state를 global virtio restore 뒤로 미루거나 BSP의 resume publication을 앞당기지 않는다.
 - Lazy page fault의 artifact 선택과 page installation은 host/Firecracker/Restorer가 담당하며 Linux fault path에 file I/O나 payload verification을 넣지 않는다.
 
 ## Input-key and runtime ABI
 
 - Restore firmware는 decrypted input private key를 14–16 MiB private mailbox의 fixed 32-byte one-shot slot에 저장한다. Slot은 최대 CPU bundle과 shared landing page에서 분리하며 input key bytes만 담는다.
-- Restored runner는 `snapshot_enter`가 0을 반환한 직후 input을 받거나 workload를 실행하기 전에 `faasev_seed_input_key(NULL, 0)`를 호출한다. Kernel은 nonzero mailbox slot을 한 번만 소비해 persistent `gcm(aes)` transform에 설치하고 slot과 temporary buffer를 지우며 syscall 실패 시 runner는 진행하지 않는다. 이미 비워진 slot의 재소비는 실패한다.
-- Normal path는 in-guest normal attestation helper가 같은 `faasev_seed_input_key(user_key, 32)` syscall을 호출한다. 두 mode는 같은 common transform-install 함수에 도달하지만 Restore key는 user memory로 복사하지 않는다.
+- Kernel BSP restore continuation은 userspace로 돌아가기 전에 nonzero mailbox slot을 한 번만 소비해 persistent `gcm(aes)` transform에 설치하고 slot과 temporary buffer를 지운다. 설치 실패는 restore를 종료하며 이미 비워진 slot의 재소비도 실패한다. Restored runner는 kernel이 key를 설치했다고 가정하고 `snapshot_enter` 반환 뒤 바로 input 처리로 진행한다.
+- Severifast/direct path는 in-guest attestation helper가 `faasev_seed_input_key(user_key, 32)` syscall을 호출한다. Syscall 453은 non-NULL user key와 정확히 32-byte 길이만 허용하며 Restore key는 user memory로 복사하지 않는다.
 - Input private key를 secrets page, snapshot artifact, shared transport 또는 user-visible log에 기록하지 않는다. Restore mailbox slot은 snapshot page artifact나 CPU bundle field가 아니다.
-- `faasev_shadow_crypto`, mailbox key offset, seed syscall 번호·두 입력 mode와 key length를 바꾸면 Restorer producer, runner와 normal-attestation-helper consumer를 같은 작업에서 수정한다.
+- `faasev_shadow_crypto`, mailbox key offset, kernel restore consumer 또는 seed syscall 번호와 key length를 바꾸면 Restorer producer와 Severifast attestation-helper consumer를 같은 작업에서 수정한다.
 
 ## I/O and boot contract
 
 - Snapshot 전후 virtio device는 existing driver freeze/restore callbacks으로 정지·복구한다.
 - Guest rootfs와 funcfs는 partition table 없이 whole-disk virtio-blk device를 사용하고 dm-verity roothash는 boot cmdline/config contract를 따른다.
-- SWIOTLB는 표준 4 KiB 경로만 사용하고 helper 전용 hugepage option이나 allocation mode를 두지 않는다. dm-verity 검증은 유지하되 verify-path 세부 timing marker는 만들지 않는다. Host fine-grained parser에 남은 verity field는 모두 0인 output-shape placeholder이며 측정값으로 해석하지 않는다.
+- SWIOTLB는 기본·최소 64 MiB buffer에서 시작하며 SEV의 표준 guest-memory 비율 조정을 유지한다. Page-state 전환은 표준 4 KiB 경로만 사용하고 helper 전용 hugepage option이나 allocation mode를 두지 않는다. dm-verity 검증은 유지하며 `verity_verify_io_inner()` 호출만 `ktime_get_ns()`로 감싸 atomic64 누적값을 read-only `/sys/module/dm_verity/parameters/read_verify_ns`에 노출한다. 검증 결과와 오류 순서는 변경하지 않고 rootfs/funcfs별 counter는 만들지 않는다.
 - Snapshot initramfs는 `snapshot_init.sh`와 `init=/bin/fc_init` path만 사용한다.
 - Required kernel config, cmdline, syscall table, header와 build wiring은 관련 기능 변경과 같은 작업에서 갱신한다.
 

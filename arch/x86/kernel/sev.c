@@ -102,22 +102,6 @@ static u8 faasev_shadow_crypto_buffer[FAASEV_SHADOW_CRYPTO_BUFFER_LEN]
 	__aligned(16);
 static bool faasev_shadow_crypto_key_ready;
 
-enum faasev_input_key_mode {
-	FAASEV_INPUT_KEY_INVALID,
-	FAASEV_INPUT_KEY_USER,
-	FAASEV_INPUT_KEY_MAILBOX,
-};
-
-static enum faasev_input_key_mode faasev_input_key_mode(
-	const u8 __user *input_key, size_t input_key_len)
-{
-	if (input_key && input_key_len == FAASEV_INPUT_PRIVATE_KEY_LEN)
-		return FAASEV_INPUT_KEY_USER;
-	if (!input_key && !input_key_len)
-		return FAASEV_INPUT_KEY_MAILBOX;
-	return FAASEV_INPUT_KEY_INVALID;
-}
-
 static int faasev_consume_input_key_slot(
 	u8 slot[FAASEV_INPUT_PRIVATE_KEY_LEN],
 	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN])
@@ -167,7 +151,8 @@ int sev_snapshot_prepare_shadow_crypto(void)
 
 	/*
 	 * Capture the persistent transform/request in the snapshot. The restore
-	 * key is installed only after userspace consumes the private mailbox slot.
+	 * continuation installs the key from the private mailbox before userspace
+	 * resumes.
 	 */
 	mutex_lock(&faasev_shadow_crypto_lock);
 	ret = faasev_shadow_crypto_init_locked();
@@ -195,34 +180,17 @@ SYSCALL_DEFINE2(faasev_seed_input_key, const u8 __user *, input_key,
 		size_t, input_key_len)
 {
 	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN] = {};
-	u8 *mailbox_key;
-	enum faasev_input_key_mode mode;
 	int ret;
 
-	mode = faasev_input_key_mode(input_key, input_key_len);
-	if (mode == FAASEV_INPUT_KEY_INVALID)
+	if (!input_key || input_key_len != sizeof(key))
 		return -EINVAL;
 
-	if (mode == FAASEV_INPUT_KEY_USER &&
-	    copy_from_user(key, input_key, sizeof(key))) {
+	if (copy_from_user(key, input_key, sizeof(key))) {
 		ret = -EFAULT;
 		goto out_zero;
 	}
 
 	mutex_lock(&faasev_shadow_crypto_lock);
-	if (mode == FAASEV_INPUT_KEY_MAILBOX) {
-		if (!sev_snapshot_mailbox_available()) {
-			ret = -ENODEV;
-			goto out_unlock;
-		}
-
-		mailbox_key = __va(SEV_SNAPSHOT_FIXED_MAILBOX_PA +
-				   SEV_SNAPSHOT_INPUT_PRIVATE_KEY_OFFSET);
-		ret = faasev_consume_input_key_slot(mailbox_key, key);
-		if (ret)
-			goto out_unlock;
-	}
-
 	if (!memchr_inv(key, 0, sizeof(key))) {
 		ret = -EINVAL;
 		goto out_unlock;
@@ -239,23 +207,44 @@ out_zero:
 	return ret;
 }
 
+int sev_snapshot_install_input_private_key(void)
+{
+	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN] = {};
+	u8 *mailbox_key;
+	int ret;
+
+	if (!sev_snapshot_mailbox_available())
+		return -ENODEV;
+
+	mailbox_key = __va(SEV_SNAPSHOT_FIXED_MAILBOX_PA +
+			   SEV_SNAPSHOT_INPUT_PRIVATE_KEY_OFFSET);
+	mutex_lock(&faasev_shadow_crypto_lock);
+	ret = faasev_consume_input_key_slot(mailbox_key, key);
+	if (!ret) {
+		ret = faasev_shadow_crypto_init_locked();
+		if (!ret)
+			ret = faasev_shadow_crypto_install_key_locked(key);
+	}
+	mutex_unlock(&faasev_shadow_crypto_lock);
+	memzero_explicit(key, sizeof(key));
+	return ret;
+}
+
 #if IS_ENABLED(CONFIG_KUNIT)
-static void faasev_input_key_modes_are_exact(struct kunit *test)
+static void faasev_seed_input_key_rejects_restore_mode(struct kunit *test)
 {
 	const u8 __user *user_key = (const u8 __user *)1UL;
+	const u8 __user *no_key = NULL;
+	const size_t no_key_len = 0;
 
-	KUNIT_EXPECT_EQ(test,
-		faasev_input_key_mode(user_key, FAASEV_INPUT_PRIVATE_KEY_LEN),
-		FAASEV_INPUT_KEY_USER);
-	KUNIT_EXPECT_EQ(test, faasev_input_key_mode(NULL, 0),
-		FAASEV_INPUT_KEY_MAILBOX);
-	KUNIT_EXPECT_EQ(test, faasev_input_key_mode(user_key, 0),
-		FAASEV_INPUT_KEY_INVALID);
-	KUNIT_EXPECT_EQ(test,
-		faasev_input_key_mode(NULL, FAASEV_INPUT_PRIVATE_KEY_LEN),
-		FAASEV_INPUT_KEY_INVALID);
-	KUNIT_EXPECT_EQ(test, faasev_input_key_mode(user_key, 31),
-		FAASEV_INPUT_KEY_INVALID);
+	KUNIT_EXPECT_EQ(test, __do_sys_faasev_seed_input_key(no_key, no_key_len),
+		(long)-EINVAL);
+	KUNIT_EXPECT_EQ(test, __do_sys_faasev_seed_input_key(user_key, 0),
+		(long)-EINVAL);
+	KUNIT_EXPECT_EQ(test, __do_sys_faasev_seed_input_key(
+		NULL, FAASEV_INPUT_PRIVATE_KEY_LEN), (long)-EINVAL);
+	KUNIT_EXPECT_EQ(test, __do_sys_faasev_seed_input_key(user_key, 31),
+		(long)-EINVAL);
 }
 
 static void faasev_mailbox_key_is_one_shot(struct kunit *test)
@@ -274,7 +263,7 @@ static void faasev_mailbox_key_is_one_shot(struct kunit *test)
 }
 
 static struct kunit_case faasev_input_key_cases[] = {
-	KUNIT_CASE(faasev_input_key_modes_are_exact),
+	KUNIT_CASE(faasev_seed_input_key_rejects_restore_mode),
 	KUNIT_CASE(faasev_mailbox_key_is_one_shot),
 	{}
 };
