@@ -89,13 +89,8 @@ bool faasev_vmpl_boot_early __section(".data");
 #define FAASEV_SHADOW_CRYPTO_ENCRYPT	1
 #define SVM_VMGEXIT_FAASEV_VMPL0_SERVICE	0x8000fa05ULL
 #define FAASEV_VMPL0_SERVICE_OP_PVALIDATE	1
-#define FAASEV_VMPL0_SERVICE_OP_CHAIN_OUTPUT	2
-#define FAASEV_VMPL0_SERVICE_OP_CHAIN_INPUT	3
-#define FAASEV_VMPL0_SERVICE_OP_CHAIN_COMMIT_OUTPUT	4
 #define FAASEV_VMPL0_SERVICE_STATUS_PENDING	1
 #define FAASEV_VMPL0_SERVICE_STATUS_OK		2
-#define FAASEV_CHAIN_ROUTE_HEAP			1
-#define FAASEV_CHAIN_ROUTE_NETWORK		2
 #define FAASEV_VMPL0_SERVICE_PVALIDATE_VALIDATE	BIT(0)
 #define FAASEV_SHADOW_CRYPTO_RECORD_SIZE	512
 #define FAASEV_SHADOW_CRYPTO_TAG_LEN		16
@@ -112,47 +107,16 @@ bool faasev_vmpl_boot_early __section(".data");
 struct faasev_vmpl0_service_page {
 	u32 opcode;
 	u32 status;
-	union {
-		struct {
-			u64 gpa;
-			u32 npages;
-			u32 flags;
-		} __packed pvalidate;
-		struct {
-			u32 route;
-			u32 outcome_len;
-			u64 ptr;
-			u64 len;
-			u8 outcome[32];
-		} __packed query;
-		struct {
-			u64 output_len;
-			u32 outcome_len;
-			u8 outcome[32];
-			u32 terminal_result;
-		} __packed commit;
-		u8 reserved[PAGE_SIZE - 8];
-	} payload;
+	struct {
+		u64 gpa;
+		u32 npages;
+		u32 flags;
+	} __packed pvalidate;
 } __packed;
 
-struct faasev_chain_buffer {
-	u32 route;
-	u64 ptr;
-	u64 len;
-};
-
-#define FAASEV_CHAIN_OBJECT_HEAP_GPA	0x04200000UL
-#define FAASEV_CHAIN_OBJECT_HEAP_USER_ADDR	0x0000700000000000UL
-#define FAASEV_CHAIN_OBJECT_HEAP_LEN	0x00400000UL
 static int faasev_vmpl0_service_pvalidate_pages(unsigned long vaddr,
 						unsigned int npages,
 						bool validate);
-static int faasev_vmpl0_service_chain_query(unsigned int opcode,
-					    const u8 *outcome, u32 outcome_len,
-					    struct faasev_chain_buffer *buffer);
-static int faasev_vmpl0_service_chain_commit(u64 output_len,
-					    const u8 *outcome,
-					    u32 outcome_len);
 static int faasev_shadow_crypto_local_sim(unsigned int operation,
 					  size_t payload_len);
 
@@ -168,135 +132,10 @@ SYSCALL_DEFINE2(faasev_shadow_crypto, unsigned int, operation,
 	return faasev_shadow_crypto_local_sim(operation, payload_len);
 }
 
-SYSCALL_DEFINE2(faasev_chain_object_heap_map, unsigned long, user_addr,
-		size_t, len)
-{
-	struct mm_struct *mm = current->mm;
-	struct vm_area_struct *vma;
-	int ret;
-
-	if (user_addr != FAASEV_CHAIN_OBJECT_HEAP_USER_ADDR ||
-	    len != FAASEV_CHAIN_OBJECT_HEAP_LEN)
-		return -EINVAL;
-	if (!mm)
-		return -EINVAL;
-
-	mmap_write_lock(mm);
-	vma = find_vma(mm, user_addr);
-	if (!vma || vma->vm_start != user_addr ||
-	    vma->vm_end < user_addr + len || !(vma->vm_flags & VM_WRITE)) {
-		ret = -EINVAL;
-		goto out_unlock;
-	}
-
-	/*
-	 * The heap is an attested, encrypted RAM reservation rather than MMIO.
-	 * Its cacheability is the ordinary encrypted-WB mapping selected by the
-	 * VMA, so there is no PAT resource to reserve.  Calling the tracked API
-	 * makes x86 PAT reject this E820-reserved range before any PTE is built.
-	 * Successor FaaSEV can preserve a page-table page containing this fixed
-	 * mapping, so this call may replace present PTEs rather than populate empty
-	 * ones. remap_pfn_range_notrack() does not invalidate those old TLB entries.
-	 */
-	ret = remap_pfn_range_notrack(vma, user_addr,
-				      FAASEV_CHAIN_OBJECT_HEAP_GPA >> PAGE_SHIFT,
-				      len, pgprot_encrypted(vma->vm_page_prot));
-	if (!ret)
-		flush_tlb_mm_range(mm, user_addr, user_addr + len,
-				   PAGE_SHIFT, false);
-
-out_unlock:
-	mmap_write_unlock(mm);
-	return ret;
-}
-
-SYSCALL_DEFINE3(faasev_chain_get_output,
-		struct faasev_chain_buffer __user *, output,
-		const u8 __user *, outcome, u32, outcome_len)
-{
-	u8 private_outcome[32] = {};
-	struct faasev_chain_buffer buffer = {};
-	int ret;
-
-	if (!output || outcome_len > sizeof(private_outcome) ||
-	    (!outcome_len && outcome) || (outcome_len && !outcome))
-		return -EINVAL;
-	if (outcome_len && copy_from_user(private_outcome, outcome, outcome_len)) {
-		ret = -EFAULT;
-		goto out_zero;
-	}
-	outb(0xaa, 0x80); /* Heap output-query entry. */
-	ret = faasev_vmpl0_service_chain_query(
-		FAASEV_VMPL0_SERVICE_OP_CHAIN_OUTPUT, private_outcome,
-		outcome_len, &buffer);
-	outb(0xab, 0x80); /* VMPL0 output-query response received. */
-	if (!ret && copy_to_user(output, &buffer, sizeof(buffer)))
-		ret = -EFAULT;
-
-out_zero:
-	memzero_explicit(private_outcome, sizeof(private_outcome));
-	return ret;
-}
-
-SYSCALL_DEFINE1(faasev_chain_get_input,
-		struct faasev_chain_buffer __user *, input)
-{
-	struct faasev_chain_buffer buffer = {};
-	int ret;
-
-	if (!input)
-		return -EINVAL;
-	ret = faasev_vmpl0_service_chain_query(
-		FAASEV_VMPL0_SERVICE_OP_CHAIN_INPUT, NULL, 0, &buffer);
-	if (ret)
-		return ret;
-	return copy_to_user(input, &buffer, sizeof(buffer)) ? -EFAULT : 0;
-}
-
-SYSCALL_DEFINE3(faasev_chain_commit_output, u64, output_len,
-		const u8 __user *, outcome, u32, outcome_len)
-{
-	u8 private_outcome[32] = {};
-	int ret;
-
-	if (outcome_len > sizeof(private_outcome) || (!outcome_len && outcome) ||
-	    (outcome_len && !outcome))
-		return -EINVAL;
-	if (outcome_len && copy_from_user(private_outcome, outcome, outcome_len)) {
-		ret = -EFAULT;
-		goto out_zero;
-	}
-	outb(0xa5, 0x80);
-	outb(0xaf, 0x80); /* Back-to-back pair measures the port-marker floor. */
-	/*
-	 * The service call disables IRQs and preemption. An accepted successor
-	 * never resumes this Linux instance: the host drains and resets virtio
-	 * at the paused VMPL0 advance boundary, before installing any successor
-	 * memory. Rejected and terminal commits leave our devices intact.
-	 * Snapshot capture still uses the full driver freeze/restore path.
-	 */
-	outb(0xa6, 0x80);
-	ret = faasev_vmpl0_service_chain_commit(output_len, private_outcome,
-						 outcome_len);
-
-out_zero:
-	memzero_explicit(private_outcome, sizeof(private_outcome));
-	return ret;
-}
-
 /* #VC handler runtime per-CPU data */
 struct sev_es_runtime_data {
 	struct ghcb ghcb_page;
 
-	/*
-	 * Heap private VMPL1<->VMPL0 service page; Single uses its mailbox.
-	 * VMPL1 notifies VMPL0 through
-	 * a GHCB page-protocol VMGEXIT that carries only a FaaSEV service
-	 * exit code.
-	 * PVALIDATE target GPAs stay in this encrypted page and are consumed
-	 * only by VMPL0.
-	 */
-	u8 faasev_service_page[PAGE_SIZE] __aligned(PAGE_SIZE);
 
 	/*
 	 * Reserve one page per CPU as backup storage for the unencrypted GHCB.
@@ -369,7 +208,7 @@ static struct faasev_vmpl0_service_page *faasev_service_page(
 {
 	if (faasev_single_mailbox())
 		return __va(faasev_single_service_gpa(smp_processor_id()));
-	return (struct faasev_vmpl0_service_page *)data->faasev_service_page;
+	return NULL;
 }
 DEFINE_STATIC_KEY_FALSE(sev_es_enable_key);
 
@@ -832,8 +671,8 @@ static int faasev_vmpl0_service_call_locked(struct faasev_vmpl0_service_page *sv
 	/*
 	 * Do not place service operands in the GHCB.  The shared GHCB page
 	 * carries only a userspace-routed service exit code; VMPL0 derives the
-	 * private service page from the CPU's fixed mailbox offset (Single)
-	 * or adjacent layout (Heap) and reads operands there.
+	 * private service page from the CPU's fixed mailbox offset and reads
+	 * operands there.
 	 */
 	barrier();
 	res = sev_es_ghcb_hv_call(ghcb, &ctxt,
@@ -873,96 +712,18 @@ static int faasev_vmpl0_service_submit_pvalidate(phys_addr_t gpa,
 	}
 
 	svc = faasev_service_page(data);
+	if (!svc) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
 	memset(svc, 0, sizeof(*svc));
 	svc->opcode = FAASEV_VMPL0_SERVICE_OP_PVALIDATE;
 	svc->status = FAASEV_VMPL0_SERVICE_STATUS_PENDING;
-	svc->payload.pvalidate.gpa = gpa;
-	svc->payload.pvalidate.npages = npages;
-	svc->payload.pvalidate.flags = validate ? FAASEV_VMPL0_SERVICE_PVALIDATE_VALIDATE : 0;
+	svc->pvalidate.gpa = gpa;
+	svc->pvalidate.npages = npages;
+	svc->pvalidate.flags = validate ? FAASEV_VMPL0_SERVICE_PVALIDATE_VALIDATE : 0;
 
 	ret = faasev_vmpl0_service_call_locked(svc);
-	memzero_explicit(svc, sizeof(*svc));
-
-out_unlock:
-	local_irq_restore(flags);
-	preempt_enable();
-	return ret;
-}
-
-static int faasev_vmpl0_service_chain_query(unsigned int opcode,
-					    const u8 *outcome, u32 outcome_len,
-					    struct faasev_chain_buffer *buffer)
-{
-	struct faasev_vmpl0_service_page *svc;
-	struct sev_es_runtime_data *data;
-	unsigned long flags;
-	int ret;
-
-	preempt_disable();
-	local_irq_save(flags);
-	data = this_cpu_read(runtime_data);
-	if (!data) {
-		ret = -ENODEV;
-		goto out_unlock;
-	}
-
-	svc = faasev_service_page(data);
-	memset(svc, 0, sizeof(*svc));
-	svc->opcode = opcode;
-	svc->status = FAASEV_VMPL0_SERVICE_STATUS_PENDING;
-	svc->payload.query.outcome_len = outcome_len;
-	if (outcome_len)
-		memcpy(svc->payload.query.outcome, outcome, outcome_len);
-	ret = faasev_vmpl0_service_call_locked(svc);
-	if (!ret && (opcode == FAASEV_VMPL0_SERVICE_OP_CHAIN_OUTPUT ||
-		     opcode == FAASEV_VMPL0_SERVICE_OP_CHAIN_INPUT)) {
-		buffer->route = svc->payload.query.route;
-		buffer->ptr = svc->payload.query.ptr;
-		buffer->len = svc->payload.query.len;
-		if ((buffer->route == FAASEV_CHAIN_ROUTE_NETWORK &&
-		     (buffer->ptr || buffer->len)) ||
-		    (buffer->route == FAASEV_CHAIN_ROUTE_HEAP &&
-		     (!buffer->ptr || !buffer->len)) ||
-		    (buffer->route != FAASEV_CHAIN_ROUTE_HEAP &&
-		     buffer->route != FAASEV_CHAIN_ROUTE_NETWORK))
-			ret = -EPROTO;
-	}
-	memzero_explicit(svc, sizeof(*svc));
-
-out_unlock:
-	local_irq_restore(flags);
-	preempt_enable();
-	return ret;
-}
-
-static int faasev_vmpl0_service_chain_commit(u64 output_len,
-					    const u8 *outcome,
-					    u32 outcome_len)
-{
-	struct faasev_vmpl0_service_page *svc;
-	struct sev_es_runtime_data *data;
-	unsigned long flags;
-	int ret;
-
-	preempt_disable();
-	local_irq_save(flags);
-	data = this_cpu_read(runtime_data);
-	if (!data) {
-		ret = -ENODEV;
-		goto out_unlock;
-	}
-
-	svc = faasev_service_page(data);
-	memset(svc, 0, sizeof(*svc));
-	svc->opcode = FAASEV_VMPL0_SERVICE_OP_CHAIN_COMMIT_OUTPUT;
-	svc->status = FAASEV_VMPL0_SERVICE_STATUS_PENDING;
-	svc->payload.commit.output_len = output_len;
-	svc->payload.commit.outcome_len = outcome_len;
-	memcpy(svc->payload.commit.outcome, outcome, outcome_len);
-
-	ret = faasev_vmpl0_service_call_locked(svc);
-	if (!ret)
-		ret = svc->payload.commit.terminal_result;
 	memzero_explicit(svc, sizeof(*svc));
 
 out_unlock:
@@ -1108,20 +869,9 @@ int sev_snapshot_install_input_private_key(void)
 	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN];
 	int ret;
 
-	phys_addr_t mailbox_gpa;
-
-	/* The measured loader records the fixed Single/Heap kernel placement. */
-	switch (boot_params.hdr.code32_start) {
-	case FAASEV_SINGLE_KERNEL_BASE:
-		mailbox_gpa = FAASEV_SINGLE_MAILBOX_BASE;
-		break;
-	case 0x05000000:
-		mailbox_gpa = 0x04600000;
-		break;
-	default:
+	if (boot_params.hdr.code32_start != FAASEV_SINGLE_KERNEL_BASE)
 		return -EINVAL;
-	}
-	mailbox = ioremap_encrypted(mailbox_gpa, sizeof(key));
+	mailbox = ioremap_encrypted(FAASEV_SINGLE_MAILBOX_BASE, sizeof(key));
 	if (!mailbox)
 		return -ENOMEM;
 	memcpy_fromio(key, mailbox, sizeof(key));
@@ -2103,8 +1853,6 @@ static void __init init_ghcb(int cpu)
 		if (cpu >= FAASEV_SINGLE_SERVICE_CPU_COUNT)
 			panic("FaaSEV Single supports only vCPU0");
 		memset(__va(faasev_single_service_gpa(cpu)), 0, PAGE_SIZE);
-	} else {
-		sev_snapshot_prepare_private_pages_pa(__pa(data->faasev_service_page), 1);
 	}
 
 	data->ghcb_active = false;
@@ -2116,35 +1864,11 @@ void __init sev_es_init_vc_handling(void)
 	int cpu;
 
 	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, ghcb_page) % PAGE_SIZE);
-	/* Heap retains the GHCB-adjacent page; Single's reservation is separate. */
-	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, faasev_service_page) != PAGE_SIZE);
-	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, backup_ghcb) != 2 * PAGE_SIZE);
-	BUILD_BUG_ON(sizeof(struct faasev_vmpl0_service_page) != PAGE_SIZE);
+	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, backup_ghcb) != PAGE_SIZE);
+	BUILD_BUG_ON(sizeof(struct faasev_vmpl0_service_page) != 24);
 	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page, opcode) != 0);
 	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page, status) != 4);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page, payload) != 8);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page,
-			     payload.query.route) != 8);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page,
-			     payload.query.outcome_len) != 12);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page,
-			     payload.query.ptr) != 16);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page,
-			     payload.query.len) != 24);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page,
-			     payload.query.outcome) != 32);
-	BUILD_BUG_ON(sizeof(struct faasev_chain_buffer) != 24);
-	BUILD_BUG_ON(offsetof(struct faasev_chain_buffer, route) != 0);
-	BUILD_BUG_ON(offsetof(struct faasev_chain_buffer, ptr) != 8);
-	BUILD_BUG_ON(offsetof(struct faasev_chain_buffer, len) != 16);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page,
-			     payload.commit.output_len) != 8);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page,
-			     payload.commit.outcome_len) != 16);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page,
-			     payload.commit.outcome) != 20);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page,
-			     payload.commit.terminal_result) != 52);
+	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page, pvalidate) != 8);
 
 	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
 		return;

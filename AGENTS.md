@@ -2,14 +2,14 @@
 
 ## Role
 
-- Linux guest는 `faasev_vmpl=1` measured direct boot, snapshot trigger와 VMSA continuation만 담당한다. Fresh boot는 VMPL1에서 수행하고 Heap continuation은 같은 snapshot을 VMPL1-3 중 선택된 lower VMPL에서 실행할 수 있다.
+- Linux guest는 `faasev_vmpl=1` measured direct boot, snapshot trigger와 VMPL1 VMSA continuation을 담당한다.
 - Artifact, attestation과 FaaSEV page policy는 Recorder, VMPL0 FaaSEV firmware와 Firecracker가 담당한다. Linux에 workflow, artifact path나 page payload 선택을 넣지 않는다.
 - FaaSEV 변경은 lower-VMPL 경로에만 제한하고 일반 VMPL0 SNP boot와 표준 Linux helper 동작을 바꾸지 않는다. 공통 규칙은 `../../AGENTS.md`를 따른다.
 
 ## VMPL1 direct boot
 
-- Guest config는 `CONFIG_PHYSICAL_START=0x1000000`, `CONFIG_RELOCATABLE=y`, `CONFIG_PHYSICAL_ALIGN=0x1000000`을 사용한다. Boot firmware가 Single/독립 child/network에는 16 MiB, Heap Parent에는 80 MiB를 선택한다. Input key mailbox는 boot header의 실제 kernel load 주소에서 각각 14 MiB/70 MiB로 결정한다.
-- Single service page는 mailbox base + `(CPU + 1) * 4 KiB`에 두고 kernel direct map 생성 전에 해당 page만 memblock memory에 추가·예약한다. Firmware E820 예약과 첫 key page의 read-only 권한은 유지한다. 현재 Snapshot/Single은 CPU0만 지원하고 초과 CPU는 거부한다. Heap은 기존 per-CPU GHCB 인접 service page를 유지한다.
+- Guest config는 `CONFIG_PHYSICAL_START=0x1000000`, `CONFIG_RELOCATABLE=y`, `CONFIG_PHYSICAL_ALIGN=0x1000000`을 사용한다. Kernel은 16 MiB, input-key mailbox는 14 MiB에 고정한다.
+- Service page는 mailbox base + `(CPU + 1) * 4 KiB`에 두고 direct map 생성 전에 memblock에 추가·예약한다. Firmware E820 예약과 key page read-only 권한을 유지한다. CPU0만 지원하고 초과 CPU는 거부한다.
 - SME 전용 `.init.scratch`는 SEV 경로에서 사용하지 않으며 kernel reserve 밖의 재사용 가능한 RAM이다. Device가 할당된 뒤 이 주소 범위를 다시 private으로 변환하지 않는다.
 
 - Compressed boot와 decompressed main-kernel early boot는 각각 진입 시 `faasev_vmpl=1`을 한 번 판정하고, 각 stage의 이후 경로는 해당 stage에 저장된 early flag를 재사용한다.
@@ -30,22 +30,14 @@
 - Linux는 CPU-state descriptor나 FaaSEV payload를 파싱하지 않고 별도 FaaSEV entry로 reboot하거나 AP/multi-vCPU 복구 경로를 두지 않는다.
 - Input private key는 `../snapshot-restorer/AGENTS.md`에 따라 VMPL0 FaaSEV firmware가 준비한 private mailbox에서 실행 재개 후 읽어 설치하고 임시 buffer를 즉시 zeroize한다. Virtio 복구는 IRQ-disabled atomic 구간을 나온 뒤 수행한다.
 
-## Heap guest ABI
-
-- Object-heap layout, bank ownership과 VMPL 권한은 `../firecracker/AGENTS.md`와 `../snapshot-restorer/AGENTS.md`를 따른다.
-- Linux는 고정 object-heap mapping과 route-aware input/output 조회·commit만 VMPL0 service로 요청한다. Query response는 `route`, `ptr`, `len`만 가지며 `NETWORK`에서는 pointer와 length가 0이다. Output query만 optional bounded outcome을 전달하고 input query는 outcome을 전달하지 않는다.
-- Runner는 `HEAP` input/output에만 object bank를 사용한다. `NETWORK` input은 shadow input을 읽고, `NETWORK` output은 shadow output을 먼저 publish한 뒤 zero length로 commit한다. Commit은 output length와 같은 outcome을 전달하고 terminal success/failure를 반환받는다.
-- Fanout/fanin scheduling과 child completion은 Linux ABI에 추가하지 않는다. Lower VMPL function은 route query와 output commit만 수행하고 VMPL0 FaaSEV firmware와 host control plane이 authenticated graph를 처리한다.
-
 ## I/O and runtime ABI
 
 - Snapshot 전후 virtio device는 기존 driver의 freeze/restore callback으로 정지·복구한다.
-- Heap commit은 IRQ/preemption을 정지한 VMPL0 service로 진입한다. Accepted successor는 이전 Linux로 복귀하지 않으며 Host가 paused chain-advance 경계에서 virtio I/O를 정리·reset한 뒤 successor memory를 설치한다. 이전 Linux의 driver teardown/RCU 대기는 수행하지 않는다. Rejected/terminal commit은 device를 변경하지 않고 caller로 복귀한다.
+
 - SWIOTLB buffer와 metadata는 접근 전에 VMPL0에 private-page 준비를 요청하며 hugepage mode는 2 MiB 정렬 범위만 사용한다.
 - Guest rootfs는 partition table 없이 whole-disk virtio-blk device를 직접 사용한다. `dm-verity` read verification 시간 측정은 실행 경로를 변경하지 않는 관측 기능으로만 유지한다.
 - `snapshot_enter` syscall은 snapshot trigger만 담당하고 CPU state, artifact와 FaaSEV plan을 Linux ABI에 추가하지 않는다.
 - Input-key 설치와 shadow-crypto 실행은 현재 syscall과 private mailbox 계약만 사용하며 key를 snapshot artifact와 shared memory에 저장하지 않는다.
-- Heap syscall은 object-heap mapping, input/output bank 조회와 output commit으로 제한한다.
 
 ## Kernel integration
 

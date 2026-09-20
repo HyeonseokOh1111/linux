@@ -375,10 +375,6 @@
 451	64	snapshot_enter		sys_snapshot_enter
 453	64	faasev_seed_input_key	sys_faasev_seed_input_key
 454	64	faasev_shadow_crypto	sys_faasev_shadow_crypto
-455	64	faasev_chain_object_heap_map	sys_faasev_chain_object_heap_map
-456	64	faasev_chain_get_output	sys_faasev_chain_get_output
-457	64	faasev_chain_get_input	sys_faasev_chain_get_input
-458	64	faasev_chain_commit_output	sys_faasev_chain_commit_output
 
 #
 # Due to a historical design error, certain syscalls are numbered differently
