@@ -1992,6 +1992,17 @@ static int npf_interception(struct kvm_vcpu *vcpu)
 	u64 error_code = svm->vmcb->control.exit_info_1;
 
 	trace_kvm_page_fault(vcpu, fault_address, error_code);
+	if ((error_code & (PFERR_GUEST_RMP_MASK | PFERR_GUEST_VMPL_MASK)) ==
+	    (PFERR_GUEST_RMP_MASK | PFERR_GUEST_VMPL_MASK) &&
+	    svm->sev_es.snp_current_vmpl != SVM_SEV_VMPL0) {
+		vcpu->run->exit_reason = KVM_EXIT_MEMORY_FAULT;
+		vcpu->run->memory.flags =
+			(error_code & PFERR_GUEST_ENC_MASK) ?
+			KVM_MEMORY_EXIT_FLAG_PRIVATE : 0;
+		vcpu->run->memory.gpa = fault_address & PAGE_MASK;
+		vcpu->run->memory.size = PAGE_SIZE;
+		return 0;
+	}
 	rc = kvm_mmu_page_fault(vcpu, fault_address, error_code,
 				static_cpu_has(X86_FEATURE_DECODEASSISTS) ?
 				svm->vmcb->control.insn_bytes : NULL,

@@ -1015,6 +1015,7 @@ static void kvm_restrictedmem_invalidate_begin(struct restrictedmem_notifier *no
 	struct kvm_gfn_range gfn_range;
 	struct kvm *kvm = slot->kvm;
 	int idx;
+	gfn_t gfn;
 
 	if (restrictedmem_get_gfn_range(slot, start, end, &gfn_range)) {
 		pr_debug("%s: Invalidation skipped, slot: %d, start: 0x%lx, end: 0x%lx, restrictedmem.index: 0x%lx\n",
@@ -1025,6 +1026,21 @@ static void kvm_restrictedmem_invalidate_begin(struct restrictedmem_notifier *no
 	pr_debug("%s: slot: %d, start: 0x%lx, end: 0x%lx, restrictedmem.index: 0x%lx, gfn_start: 0x%llx, gfn_end: 0x%llx\n",
 		 __func__, slot->id, start, end, slot->restrictedmem.index, gfn_range.start,
 		 gfn_range.end);
+
+	/*
+	 * The restrictedmem hole-punch/unbind path calls this callback before
+	 * releasing pages.  Count only backing that exists in the invalidated
+	 * subrange; a state transition by itself must not reduce this value.
+	 */
+	for (gfn = gfn_range.start; gfn < gfn_range.end; gfn++) {
+		kvm_pfn_t pfn;
+
+		if (!kvm_restrictedmem_get_pfn_noalloc(slot, gfn, &pfn, NULL)) {
+			atomic64_sub(PAGE_SIZE,
+				     &kvm->faasev_restricted_private_bytes);
+			put_page(pfn_to_page(pfn));
+		}
+	}
 
 	idx = srcu_read_lock(&kvm->srcu);
 	KVM_MMU_LOCK(kvm);
@@ -1381,6 +1397,7 @@ static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
 	spin_lock_init(&kvm->gpc_lock);
 
 	INIT_LIST_HEAD(&kvm->devices);
+	atomic64_set(&kvm->faasev_restricted_private_bytes, 0);
 	kvm->max_vcpus = KVM_MAX_VCPUS;
 
 	BUILD_BUG_ON(KVM_MEM_SLOTS_NUM > SHRT_MAX);
@@ -2677,13 +2694,16 @@ static int kvm_vm_ioctl_set_mem_attributes(struct kvm *kvm,
 {
 	gfn_t start, end;
 	unsigned long i;
-	const u64 valid_flags = KVM_MEMORY_ATTRIBUTE_FAASEV_ALLOW_HUGE_PRIVATE;
+	const u64 private_flags =
+		KVM_MEMORY_ATTRIBUTE_FAASEV_ALLOW_HUGE_PRIVATE |
+		KVM_MEMORY_ATTRIBUTE_FAASEV_POPULATE_PRIVATE;
+	const u64 valid_flags = private_flags;
 
 	if (attrs->flags & ~valid_flags)
 		return -EINVAL;
 	if (attrs->attributes & ~kvm_supported_mem_attributes(kvm))
 		return -EINVAL;
-	if ((attrs->flags & KVM_MEMORY_ATTRIBUTE_FAASEV_ALLOW_HUGE_PRIVATE) &&
+	if ((attrs->flags & private_flags) &&
 	    !(attrs->attributes & KVM_MEMORY_ATTRIBUTE_PRIVATE))
 		return -EINVAL;
 	if (attrs->size == 0 || attrs->address + attrs->size < attrs->address)

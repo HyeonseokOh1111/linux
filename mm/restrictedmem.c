@@ -2,11 +2,14 @@
 #include "linux/sbitmap.h"
 #include <linux/pagemap.h>
 #include <linux/pseudo_fs.h>
+#include <linux/rwsem.h>
 #include <linux/shmem_fs.h>
 #include <linux/syscalls.h>
+#include <linux/xarray.h>
 #include <uapi/linux/falloc.h>
 #include <uapi/linux/magic.h>
 #include <linux/restrictedmem.h>
+#include <linux/hugetlb.h>
 
 struct restrictedmem {
 	struct rw_semaphore lock;
@@ -35,6 +38,10 @@ static long restrictedmem_punch_hole(struct restrictedmem *rm, int mode,
 	int ret;
 
 	if (!PAGE_ALIGNED(offset) || !PAGE_ALIGNED(len))
+		return -EINVAL;
+	if (is_file_hugepages(memfd) &&
+	    (!IS_ALIGNED(offset, huge_page_size(hstate_file(memfd))) ||
+	     !IS_ALIGNED(len, huge_page_size(hstate_file(memfd)))))
 		return -EINVAL;
 
 	start = offset >> PAGE_SHIFT;
@@ -192,8 +199,8 @@ static int restricted_error_remove_page(struct address_space *mapping,
        struct inode *inode, *next;
        pgoff_t start, end;
 
-       start = page->index;
-       end = start + thp_nr_pages(page);
+       start = PageHuge(page) ? page->index << compound_order(page) : page->index;
+       end = start + thp_nr_pages(page) - 1;
 
        spin_lock(&sb->s_inode_list_lock);
        list_for_each_entry_safe(inode, next, &sb->s_inodes, i_sb_list) {
@@ -235,14 +242,18 @@ SYSCALL_DEFINE1(memfd_restricted, unsigned int, flags)
 	struct file *file, *restricted_file;
 	int fd, err;
 
-	if (flags)
+	if (flags & ~RESTRICTEDMEM_HUGETLB)
 		return -EINVAL;
 
 	fd = get_unused_fd_flags(0);
 	if (fd < 0)
 		return fd;
 
-	file = shmem_file_setup("memfd:restrictedmem", 0, VM_NORESERVE);
+	if (flags & RESTRICTEDMEM_HUGETLB)
+		file = hugetlb_file_setup("memfd:restrictedmem", 0,
+					 VM_NORESERVE, HUGETLB_ANONHUGE_INODE, 21);
+	else
+		file = shmem_file_setup("memfd:restrictedmem", 0, VM_NORESERVE);
 	if (IS_ERR(file)) {
 		err = PTR_ERR(file);
 		goto err_fd;
@@ -318,6 +329,36 @@ void restrictedmem_unbind(struct file *file, pgoff_t start, pgoff_t end,
 }
 EXPORT_SYMBOL_GPL(restrictedmem_unbind);
 
+/* HugeTLB page-cache indices count huge pages, not 4 KiB pages. */
+static int restrictedmem_get_hugetlb_page(struct file *memfd, pgoff_t offset,
+					 struct page **pagep, int *order,
+					 bool allocate)
+{
+	struct hstate *h = hstate_file(memfd);
+	unsigned int shift = huge_page_order(h);
+	pgoff_t index = offset >> shift;
+	struct page *head;
+	int ret;
+
+	head = find_get_page(memfd->f_mapping, index);
+	if (!head && allocate) {
+		ret = memfd->f_op->fallocate(memfd, 0,
+				(loff_t)index << huge_page_shift(h),
+				huge_page_size(h));
+		if (ret)
+			return ret;
+		head = find_get_page(memfd->f_mapping, index);
+	}
+	if (!head)
+		return -ENOENT;
+
+	/* restricted_aops rejects migration before RMP ownership is installed. */
+	*pagep = nth_page(head, offset & ((1UL << shift) - 1));
+	if (order)
+		*order = shift;
+	return 0;
+}
+
 int restrictedmem_get_page(struct file *file, pgoff_t offset,
 			   struct page **pagep, int *order)
 {
@@ -330,6 +371,10 @@ int restrictedmem_get_page(struct file *file, pgoff_t offset,
 	/* Sanity check that _someone_ bound the target offset. */
 	if (WARN_ON_ONCE(!xa_load(&rm->bindings, offset)))
 		return -EINVAL;
+
+	if (is_file_hugepages(memfd))
+		return restrictedmem_get_hugetlb_page(memfd, offset, pagep,
+						    order, true);
 
 	ret = shmem_get_folio(file_inode(memfd), offset, &folio, SGP_WRITE);
 	if (ret)
@@ -346,3 +391,33 @@ int restrictedmem_get_page(struct file *file, pgoff_t offset,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(restrictedmem_get_page);
+
+int restrictedmem_get_page_noalloc(struct file *file, pgoff_t offset,
+				   struct page **pagep, int *order)
+{
+	struct restrictedmem *rm = file->f_mapping->private_data;
+	struct folio *folio;
+	struct page *page;
+
+	/* Sanity check that _someone_ bound the target offset. */
+	if (WARN_ON_ONCE(!xa_load(&rm->bindings, offset)))
+		return -EINVAL;
+
+	if (is_file_hugepages(rm->memfd))
+		return restrictedmem_get_hugetlb_page(rm->memfd, offset, pagep,
+						    order, false);
+
+	folio = filemap_get_folio(rm->memfd->f_mapping, offset);
+	if (IS_ERR(folio))
+		return PTR_ERR(folio);
+	if (!folio)
+		return -ENOENT;
+
+	page = folio_file_page(folio, offset);
+	*pagep = page;
+	if (order)
+		*order = thp_order(compound_head(page));
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(restrictedmem_get_page_noalloc);

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include "../severifast_profile.h"
 #include "mmu.h"
 #include "mmu_internal.h"
 #include "mmutrace.h"
@@ -528,6 +529,9 @@ static void __handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
 	bool was_leaf = was_present && is_last_spte(old_spte, level);
 	bool is_leaf = is_present && is_last_spte(new_spte, level);
 	bool pfn_changed = spte_to_pfn(old_spte) != spte_to_pfn(new_spte);
+
+	if (was_leaf && is_accessed_spte(old_spte))
+		severifast_record_access(kvm, gfn, level);
 
 	WARN_ON(level > PT64_ROOT_MAX_LEVEL);
 	WARN_ON(level < PG_LEVEL_4K);
@@ -1910,4 +1914,38 @@ u64 *kvm_tdp_mmu_fast_pf_get_last_sptep(struct kvm_vcpu *vcpu, u64 addr,
 	 * outside of mmu_lock.
 	 */
 	return rcu_dereference(sptep);
+}
+
+/* The caller is the sole paused vCPU at the guest's phase marker. */
+void kvm_severifast_access_boundary(struct kvm *kvm, unsigned int phase)
+{
+	struct severifast_profile *p = kvm->arch.severifast_profile;
+	struct kvm_mmu_page *root;
+	struct tdp_iter iter;
+	bool flush = false;
+
+	write_lock(&kvm->mmu_lock);
+	/* Discard firmware mappings before counting: a huge leaf's A bit cannot
+	 * identify which 4 KiB subpages were accessed. Subsequent faults use 4K.
+	 */
+	if (!p->access_shift && phase == 1) {
+		flush = kvm_tdp_mmu_zap_leafs(kvm, 0, 0, p->bins, false, false);
+		goto finish;
+	}
+	for_each_tdp_mmu_root(kvm, root, 0) {
+		rcu_read_lock();
+		tdp_root_for_each_leaf_pte(iter, root, 0, p->bins << p->access_shift) {
+			if (!is_accessed_spte(iter.old_spte))
+				continue;
+			severifast_record_access(kvm, iter.gfn, iter.level);
+			age_gfn_range(kvm, &iter, NULL);
+			flush = true;
+		}
+		rcu_read_unlock();
+	}
+finish:
+	if (flush)
+		kvm_flush_remote_tlbs(kvm);
+	WRITE_ONCE(p->phase, phase);
+	write_unlock(&kvm->mmu_lock);
 }

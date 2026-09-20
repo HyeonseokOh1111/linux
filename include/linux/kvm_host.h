@@ -822,6 +822,12 @@ struct kvm {
 	u64 manual_dirty_log_protect;
 	struct dentry *debugfs_dentry;
 	struct kvm_stat_data **debugfs_stat_data;
+	/*
+	 * FaaSEV sampling counter for restrictedmem pages that are currently
+	 * backed by physical memory.  It is updated only when restrictedmem
+	 * backing is created or invalidated; debugfs readers never fault pages.
+	 */
+	atomic64_t faasev_restricted_private_bytes;
 	struct srcu_struct srcu;
 	struct srcu_struct irq_srcu;
 	pid_t userspace_pid;
@@ -2365,15 +2371,47 @@ static inline int kvm_restrictedmem_get_pfn(struct kvm_memory_slot *slot,
 {
 	pgoff_t index = gfn - slot->base_gfn + slot->restrictedmem.index;
 	struct page *page;
+	int page_order;
+	int *get_order = order ? order : &page_order;
 	int ret;
 
-	ret = restrictedmem_get_page(slot->restrictedmem.file, index, &page, order);
+	ret = restrictedmem_get_page_noalloc(slot->restrictedmem.file, index,
+					      &page, get_order);
+	if (!ret) {
+		*pfn = page_to_pfn(page);
+		return 0;
+	}
+	if (ret != -ENOENT)
+		return ret;
+
+	ret = restrictedmem_get_page(slot->restrictedmem.file, index, &page,
+				     get_order);
+	if (ret)
+		return ret;
+
+	atomic64_add(PAGE_SIZE << *get_order,
+		     &slot->kvm->faasev_restricted_private_bytes);
+	*pfn = page_to_pfn(page);
+	return 0;
+}
+
+static inline int kvm_restrictedmem_get_pfn_noalloc(struct kvm_memory_slot *slot,
+						    gfn_t gfn, kvm_pfn_t *pfn,
+						    int *order)
+{
+	pgoff_t index = gfn - slot->base_gfn + slot->restrictedmem.index;
+	struct page *page;
+	int ret;
+
+	ret = restrictedmem_get_page_noalloc(slot->restrictedmem.file, index,
+					     &page, order);
 	if (ret)
 		return ret;
 
 	*pfn = page_to_pfn(page);
 	return 0;
 }
+
 #else
 static inline int kvm_restrictedmem_get_pfn(struct kvm_memory_slot *slot,
 					    gfn_t gfn, kvm_pfn_t *pfn,
@@ -2382,6 +2420,15 @@ static inline int kvm_restrictedmem_get_pfn(struct kvm_memory_slot *slot,
 	KVM_BUG_ON(1, slot->kvm);
 	return -EIO;
 }
+
+static inline int kvm_restrictedmem_get_pfn_noalloc(struct kvm_memory_slot *slot,
+						    gfn_t gfn, kvm_pfn_t *pfn,
+						    int *order)
+{
+	KVM_BUG_ON(1, slot->kvm);
+	return -EIO;
+}
+
 #endif /* CONFIG_KVM_PRIVATE_MEM */
 
 #endif

@@ -17,6 +17,7 @@
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include "severifast_profile.h"
 #include <linux/kvm_host.h>
 #include "irq.h"
 #include "ioapic.h"
@@ -12387,6 +12388,11 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
 	kvm_page_track_cleanup(kvm);
 	kvm_xen_destroy_vm(kvm);
 	kvm_hv_destroy_vm(kvm);
+	if (kvm->arch.severifast_profile) {
+		bitmap_free(kvm->arch.severifast_profile->access[0]);
+		bitmap_free(kvm->arch.severifast_profile->access[1]);
+		kfree(kvm->arch.severifast_profile);
+	}
 }
 
 static void memslot_rmap_free(struct kvm_memory_slot *slot)

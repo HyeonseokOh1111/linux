@@ -6,6 +6,9 @@
 #include <linux/magic.h>
 #include <linux/pfn_t.h>
 
+/* memfd_restricted(): demand-allocate 2 MiB pages from the HugeTLB pool. */
+#define RESTRICTEDMEM_HUGETLB (1U << 0)
+
 struct restrictedmem_notifier;
 
 struct restrictedmem_notifier_ops {
@@ -30,6 +33,8 @@ void restrictedmem_unbind(struct file *file, pgoff_t start, pgoff_t end,
 
 int restrictedmem_get_page(struct file *file, pgoff_t offset,
 			   struct page **pagep, int *order);
+int restrictedmem_get_page_noalloc(struct file *file, pgoff_t offset,
+				   struct page **pagep, int *order);
 
 static inline bool file_is_restrictedmem(struct file *file)
 {

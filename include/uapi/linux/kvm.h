@@ -2052,6 +2052,8 @@ struct kvm_sev_snp_launch_start {
 #define KVM_SEV_SNP_PAGE_TYPE_UNMEASURED	0x4
 #define KVM_SEV_SNP_PAGE_TYPE_SECRETS		0x5
 #define KVM_SEV_SNP_PAGE_TYPE_CPUID		0x6
+#define KVM_SEV_SNP_PAGE_SIZE_4K		0x0
+#define KVM_SEV_SNP_PAGE_SIZE_2M		0x1
 
 struct kvm_sev_snp_launch_update {
 	__u64 start_gfn;
@@ -2062,6 +2064,8 @@ struct kvm_sev_snp_launch_update {
 	__u8 vmpl3_perms;
 	__u8 vmpl2_perms;
 	__u8 vmpl1_perms;
+	__u8 page_size;
+	__u8 pad[6];
 };
 
 #define KVM_SEV_SNP_ID_BLOCK_SIZE	96
@@ -2354,5 +2358,6 @@ struct kvm_memory_attributes {
 
 #define KVM_MEMORY_ATTRIBUTE_PRIVATE           (1ULL << 3)
 #define KVM_MEMORY_ATTRIBUTE_FAASEV_ALLOW_HUGE_PRIVATE (1ULL << 0)
+#define KVM_MEMORY_ATTRIBUTE_FAASEV_POPULATE_PRIVATE (1ULL << 1)
 
 #endif /* __LINUX_KVM_H */

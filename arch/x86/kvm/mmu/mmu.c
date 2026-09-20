@@ -27,6 +27,7 @@
 #include "kvm_emulate.h"
 #include "cpuid.h"
 #include "spte.h"
+#include "../severifast_profile.h"
 
 #include <linux/kvm_host.h>
 #include <linux/types.h>
@@ -3089,8 +3090,14 @@ static int __kvm_mmu_max_mapping_level(struct kvm *kvm,
 				       const struct kvm_memory_slot *slot,
 				       gfn_t gfn, int max_level, bool is_private)
 {
+	struct severifast_profile *profile = READ_ONCE(kvm->arch.severifast_profile);
 	struct kvm_lpage_info *linfo;
 	int host_level;
+
+	/* Fine-grained access tracking changes NPT leaves, not backing or RMP. */
+	if (profile && profile->access[0] && !profile->access_shift &&
+	    READ_ONCE(profile->phase))
+		return PG_LEVEL_4K;
 
 	max_level = min(max_level, max_huge_page_level);
 	for ( ; max_level > PG_LEVEL_4K; max_level--) {
@@ -4247,10 +4254,9 @@ static int kvm_do_memory_fault_exit(struct kvm_vcpu *vcpu,
 				    struct kvm_page_fault *fault)
 {
 	vcpu->run->exit_reason = KVM_EXIT_MEMORY_FAULT;
+	vcpu->run->memory.flags = 0;
 	if (fault->is_private)
-		vcpu->run->memory.flags = KVM_MEMORY_EXIT_FLAG_PRIVATE;
-	else
-		vcpu->run->memory.flags = 0;
+		vcpu->run->memory.flags |= KVM_MEMORY_EXIT_FLAG_PRIVATE;
 	vcpu->run->memory.gpa = fault->gfn << PAGE_SHIFT;
 	vcpu->run->memory.size = PAGE_SIZE;
 	return RET_PF_USER;

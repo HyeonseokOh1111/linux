@@ -1237,6 +1237,7 @@ enum kvm_apicv_inhibit {
 };
 
 struct kvm_arch {
+	struct severifast_profile *severifast_profile;
 	unsigned long vm_type;
 	unsigned long n_used_mmu_pages;
 	unsigned long n_requested_mmu_pages;
