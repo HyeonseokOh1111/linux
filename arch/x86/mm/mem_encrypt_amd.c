@@ -45,7 +45,6 @@ u64 sev_status __section(".data") = 0;
 u64 sev_check_data __section(".data") = 0;
 EXPORT_SYMBOL(sme_me_mask);
 
-extern char __init_scratch_begin[], __init_scratch_end[];
 
 /* Buffer used for early in-place encryption by BSP, no locking needed */
 static char sme_early_buffer[PAGE_SIZE] __initdata __aligned(PAGE_SIZE);
@@ -229,6 +228,8 @@ void __init sev_setup_arch(void)
 
 	if (!cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
 		return;
+
+	sev_reserve_single_service_pages();
 
 	/*
 	 * For SEV, all DMA has to occur via shared/unencrypted pages.
@@ -512,22 +513,10 @@ void __init sme_early_init(void)
 
 void __init mem_encrypt_free_decrypted_mem(void)
 {
-	unsigned long paddr, paddr_end, vaddr, vaddr_end, npages;
+	unsigned long vaddr, vaddr_end, npages;
 	bool vmpl_boot = faasev_vmpl_boot_early;
 	int r;
 
-	/* .init.scratch is outside the kernel reserve but remains decrypted. */
-	if (sme_me_mask && vmpl_boot) {
-		paddr = ALIGN_DOWN(__pa_symbol(__init_scratch_begin), PAGE_SIZE);
-		paddr_end = PAGE_ALIGN(__pa_symbol(__init_scratch_end));
-		npages = (paddr_end - paddr) >> PAGE_SHIFT;
-		sev_snapshot_prepare_private_pages_pa(paddr, npages);
-		r = set_memory_encrypted((unsigned long)__va(paddr), npages);
-		if (r) {
-			pr_warn("failed to make init scratch private\n");
-			return;
-		}
-	}
 
 	vaddr = (unsigned long)__start_bss_decrypted_unused;
 	vaddr_end = (unsigned long)__end_bss_decrypted;

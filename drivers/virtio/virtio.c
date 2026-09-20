@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/virtio.h>
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+#include <linux/io.h>
+#include <asm/sev.h>
+#endif
 #include <linux/spinlock.h>
 #include <linux/virtio_config.h>
 #include <linux/virtio_anchor.h>
@@ -564,7 +568,16 @@ static int virtio_sev_snapshot_freeze_one(struct device *dev, void *data)
 	if (!drv->freeze || !drv->restore)
 		return 0;
 
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (faasev_vmpl_boot_early)
+		outb(0xb0 + vdev->id.device, 0x80); /* Device freeze begins: net=1, block=2. */
+#endif
 	*ret = virtio_device_freeze(vdev);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (faasev_vmpl_boot_early)
+		outb(0xc0 + vdev->id.device, 0x80);
+#endif
+
 	return 0;
 }
 

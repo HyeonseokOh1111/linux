@@ -9,6 +9,10 @@
 #include <linux/ethtool.h>
 #include <linux/module.h>
 #include <linux/virtio.h>
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+#include <linux/io.h>
+#include <asm/sev.h>
+#endif
 #include <linux/virtio_net.h>
 #include <linux/bpf.h>
 #include <linux/bpf_trace.h>
@@ -4221,9 +4225,28 @@ static __maybe_unused int virtnet_freeze(struct virtio_device *vdev)
 {
 	struct virtnet_info *vi = vdev->priv;
 
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (faasev_vmpl_boot_early)
+		outb(0xe0, 0x80);
+#endif
 	virtnet_cpu_notif_remove(vi);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (faasev_vmpl_boot_early)
+		outb(0xe1, 0x80);
+#endif
+
 	virtnet_freeze_down(vdev);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (faasev_vmpl_boot_early)
+		outb(0xe2, 0x80);
+#endif
+
 	remove_vq_common(vi);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (faasev_vmpl_boot_early)
+		outb(0xe3, 0x80);
+#endif
+
 
 	return 0;
 }

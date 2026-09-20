@@ -8,6 +8,10 @@
 #include <linux/mutex.h>
 #include <linux/interrupt.h>
 #include <linux/virtio.h>
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+#include <linux/io.h>
+#include <asm/sev.h>
+#endif
 #include <linux/virtio_blk.h>
 #include <linux/scatterlist.h>
 #include <linux/string_helpers.h>
@@ -1638,16 +1642,40 @@ static int virtblk_freeze(struct virtio_device *vdev)
 {
 	struct virtio_blk *vblk = vdev->priv;
 
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (faasev_vmpl_boot_early)
+		outb(0xd0, 0x80);
+#endif
 	/* Ensure we don't receive any more interrupts */
 	virtio_reset_device(vdev);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (faasev_vmpl_boot_early)
+		outb(0xd1, 0x80);
+#endif
+
 
 	/* Make sure no work handler is accessing the device. */
 	flush_work(&vblk->config_work);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (faasev_vmpl_boot_early)
+		outb(0xd2, 0x80);
+#endif
+
 
 	blk_mq_quiesce_queue(vblk->disk->queue);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (faasev_vmpl_boot_early)
+		outb(0xd3, 0x80);
+#endif
+
 
 	vdev->config->del_vqs(vdev);
 	kfree(vblk->vqs);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (faasev_vmpl_boot_early)
+		outb(0xd4, 0x80);
+#endif
+
 
 	return 0;
 }

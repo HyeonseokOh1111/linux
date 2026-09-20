@@ -102,7 +102,10 @@ bool faasev_vmpl_boot_early __section(".data");
 #define FAASEV_SHADOW_CRYPTO_IV_LEN		12
 #define FAASEV_SHADOW_CRYPTO_KEY_LEN		16
 #define FAASEV_INPUT_PRIVATE_KEY_LEN		32
-#define FAASEV_PRIVATE_MAILBOX_GPA	0x04600000ULL
+#define FAASEV_SINGLE_KERNEL_BASE		0x01000000UL
+#define FAASEV_SINGLE_MAILBOX_BASE		0x00e00000UL
+#define FAASEV_PRIVATE_MAILBOX_SIZE		0x00200000UL
+#define FAASEV_SINGLE_SERVICE_CPU_COUNT		1
 #define FAASEV_SHADOW_CRYPTO_BUFFER_LEN		\
 	(FAASEV_SHADOW_CRYPTO_RECORD_SIZE + FAASEV_SHADOW_CRYPTO_TAG_LEN)
 
@@ -222,9 +225,11 @@ SYSCALL_DEFINE3(faasev_chain_get_output,
 		ret = -EFAULT;
 		goto out_zero;
 	}
+	outb(0xaa, 0x80); /* Heap output-query entry. */
 	ret = faasev_vmpl0_service_chain_query(
 		FAASEV_VMPL0_SERVICE_OP_CHAIN_OUTPUT, private_outcome,
 		outcome_len, &buffer);
+	outb(0xab, 0x80); /* VMPL0 output-query response received. */
 	if (!ret && copy_to_user(output, &buffer, sizeof(buffer)))
 		ret = -EFAULT;
 
@@ -252,7 +257,7 @@ SYSCALL_DEFINE3(faasev_chain_commit_output, u64, output_len,
 		const u8 __user *, outcome, u32, outcome_len)
 {
 	u8 private_outcome[32] = {};
-	int restore_ret, ret;
+	int ret;
 
 	if (outcome_len > sizeof(private_outcome) || (!outcome_len && outcome) ||
 	    (outcome_len && !outcome))
@@ -261,16 +266,18 @@ SYSCALL_DEFINE3(faasev_chain_commit_output, u64, output_len,
 		ret = -EFAULT;
 		goto out_zero;
 	}
-	ret = sev_snapshot_freeze_virtio_devices();
-	if (ret)
-		goto out_zero;
+	outb(0xa5, 0x80);
+	outb(0xaf, 0x80); /* Back-to-back pair measures the port-marker floor. */
+	/*
+	 * The service call disables IRQs and preemption. An accepted successor
+	 * never resumes this Linux instance: the host drains and resets virtio
+	 * at the paused VMPL0 advance boundary, before installing any successor
+	 * memory. Rejected and terminal commits leave our devices intact.
+	 * Snapshot capture still uses the full driver freeze/restore path.
+	 */
+	outb(0xa6, 0x80);
 	ret = faasev_vmpl0_service_chain_commit(output_len, private_outcome,
 						 outcome_len);
-	if (ret <= 0) {
-		restore_ret = sev_snapshot_faasev_virtio_devices();
-		if (restore_ret && !ret)
-			ret = restore_ret;
-	}
 
 out_zero:
 	memzero_explicit(private_outcome, sizeof(private_outcome));
@@ -282,7 +289,8 @@ struct sev_es_runtime_data {
 	struct ghcb ghcb_page;
 
 	/*
-	 * Private VMPL1<->VMPL0 service page.  VMPL1 notifies VMPL0 through
+	 * Heap private VMPL1<->VMPL0 service page; Single uses its mailbox.
+	 * VMPL1 notifies VMPL0 through
 	 * a GHCB page-protocol VMGEXIT that carries only a FaaSEV service
 	 * exit code.
 	 * PVALIDATE target GPAs stay in this encrypted page and are consumed
@@ -327,6 +335,42 @@ struct ghcb_state {
 };
 
 static DEFINE_PER_CPU(struct sev_es_runtime_data*, runtime_data);
+
+static bool faasev_single_mailbox(void)
+{
+	return faasev_vmpl_boot_early &&
+		boot_params.hdr.code32_start == FAASEV_SINGLE_KERNEL_BASE;
+}
+
+static phys_addr_t faasev_single_service_gpa(unsigned int cpu)
+{
+	return FAASEV_SINGLE_MAILBOX_BASE + (cpu + 1UL) * PAGE_SIZE;
+}
+
+void __init sev_reserve_single_service_pages(void)
+{
+	phys_addr_t base = faasev_single_service_gpa(0);
+	unsigned long size = FAASEV_SINGLE_SERVICE_CPU_COUNT * PAGE_SIZE;
+
+	BUILD_BUG_ON((FAASEV_SINGLE_SERVICE_CPU_COUNT + 1) * PAGE_SIZE >
+		     FAASEV_PRIVATE_MAILBOX_SIZE);
+	if (!faasev_single_mailbox())
+		return;
+
+	/* Map encrypted RAM before trap_init(), but never offer it to the
+	 * allocator. Keep the firmware E820 reservation and key page unchanged.
+	 */
+	if (memblock_reserve(base, size) || memblock_add(base, size))
+		panic("Can't reserve FaaSEV Single service pages");
+}
+
+static struct faasev_vmpl0_service_page *faasev_service_page(
+		struct sev_es_runtime_data *data)
+{
+	if (faasev_single_mailbox())
+		return __va(faasev_single_service_gpa(smp_processor_id()));
+	return (struct faasev_vmpl0_service_page *)data->faasev_service_page;
+}
 DEFINE_STATIC_KEY_FALSE(sev_es_enable_key);
 
 static DEFINE_PER_CPU(struct sev_es_save_area *, sev_vmsa);
@@ -788,8 +832,8 @@ static int faasev_vmpl0_service_call_locked(struct faasev_vmpl0_service_page *sv
 	/*
 	 * Do not place service operands in the GHCB.  The shared GHCB page
 	 * carries only a userspace-routed service exit code; VMPL0 derives the
-	 * private service page from the fixed adjacent layout and reads
-	 * operands there.
+	 * private service page from the CPU's fixed mailbox offset (Single)
+	 * or adjacent layout (Heap) and reads operands there.
 	 */
 	barrier();
 	res = sev_es_ghcb_hv_call(ghcb, &ctxt,
@@ -828,7 +872,7 @@ static int faasev_vmpl0_service_submit_pvalidate(phys_addr_t gpa,
 		goto out_unlock;
 	}
 
-	svc = (struct faasev_vmpl0_service_page *)data->faasev_service_page;
+	svc = faasev_service_page(data);
 	memset(svc, 0, sizeof(*svc));
 	svc->opcode = FAASEV_VMPL0_SERVICE_OP_PVALIDATE;
 	svc->status = FAASEV_VMPL0_SERVICE_STATUS_PENDING;
@@ -862,7 +906,7 @@ static int faasev_vmpl0_service_chain_query(unsigned int opcode,
 		goto out_unlock;
 	}
 
-	svc = (struct faasev_vmpl0_service_page *)data->faasev_service_page;
+	svc = faasev_service_page(data);
 	memset(svc, 0, sizeof(*svc));
 	svc->opcode = opcode;
 	svc->status = FAASEV_VMPL0_SERVICE_STATUS_PENDING;
@@ -908,7 +952,7 @@ static int faasev_vmpl0_service_chain_commit(u64 output_len,
 		goto out_unlock;
 	}
 
-	svc = (struct faasev_vmpl0_service_page *)data->faasev_service_page;
+	svc = faasev_service_page(data);
 	memset(svc, 0, sizeof(*svc));
 	svc->opcode = FAASEV_VMPL0_SERVICE_OP_CHAIN_COMMIT_OUTPUT;
 	svc->status = FAASEV_VMPL0_SERVICE_STATUS_PENDING;
@@ -1064,8 +1108,20 @@ int sev_snapshot_install_input_private_key(void)
 	u8 key[FAASEV_INPUT_PRIVATE_KEY_LEN];
 	int ret;
 
-	mailbox = ioremap_encrypted(FAASEV_PRIVATE_MAILBOX_GPA,
-				    sizeof(key));
+	phys_addr_t mailbox_gpa;
+
+	/* The measured loader records the fixed Single/Heap kernel placement. */
+	switch (boot_params.hdr.code32_start) {
+	case FAASEV_SINGLE_KERNEL_BASE:
+		mailbox_gpa = FAASEV_SINGLE_MAILBOX_BASE;
+		break;
+	case 0x05000000:
+		mailbox_gpa = 0x04600000;
+		break;
+	default:
+		return -EINVAL;
+	}
+	mailbox = ioremap_encrypted(mailbox_gpa, sizeof(key));
 	if (!mailbox)
 		return -ENOMEM;
 	memcpy_fromio(key, mailbox, sizeof(key));
@@ -2042,7 +2098,14 @@ static void __init init_ghcb(int cpu)
 		panic("Can't map GHCBs unencrypted");
 
 	memset(&data->ghcb_page, 0, sizeof(data->ghcb_page));
-	sev_snapshot_prepare_private_pages_pa(__pa(data->faasev_service_page), 1);
+	if (faasev_single_mailbox()) {
+		/* Recorder prepared this private RW page before entering VMPL1. */
+		if (cpu >= FAASEV_SINGLE_SERVICE_CPU_COUNT)
+			panic("FaaSEV Single supports only vCPU0");
+		memset(__va(faasev_single_service_gpa(cpu)), 0, PAGE_SIZE);
+	} else {
+		sev_snapshot_prepare_private_pages_pa(__pa(data->faasev_service_page), 1);
+	}
 
 	data->ghcb_active = false;
 	data->backup_ghcb_active = false;
@@ -2053,6 +2116,7 @@ void __init sev_es_init_vc_handling(void)
 	int cpu;
 
 	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, ghcb_page) % PAGE_SIZE);
+	/* Heap retains the GHCB-adjacent page; Single's reservation is separate. */
 	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, faasev_service_page) != PAGE_SIZE);
 	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, backup_ghcb) != 2 * PAGE_SIZE);
 	BUILD_BUG_ON(sizeof(struct faasev_vmpl0_service_page) != PAGE_SIZE);
@@ -2267,12 +2331,6 @@ static enum es_result vc_handle_invalid(struct ghcb *ghcb, struct es_em_ctxt *ct
 
 	ctxt->insn.length = 0;
 	return ES_OK;
-}
-
-void arch_alloc_page(struct page *page, int order)
-{
-	if (faasev_vmpl_boot_early)
-		sev_snapshot_prepare_private_pages_pa(page_to_phys(page), 1U << order);
 }
 
 static enum es_result vc_handle_mmio(struct ghcb *ghcb, struct es_em_ctxt *ctxt)

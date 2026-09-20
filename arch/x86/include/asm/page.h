@@ -18,11 +18,6 @@
 
 struct page;
 
-#ifdef CONFIG_AMD_MEM_ENCRYPT
-void arch_alloc_page(struct page *page, int order);
-#define HAVE_ARCH_ALLOC_PAGE
-#endif
-
 #include <linux/range.h>
 extern struct range pfn_mapped[];
 extern int nr_pfn_mapped;

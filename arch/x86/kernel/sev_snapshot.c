@@ -25,11 +25,14 @@
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/string.h>
+#include <linux/swiotlb.h>
+#include <linux/timekeeping.h>
 #include <linux/tick.h>
 #include <linux/uaccess.h>
 #include <linux/virtio.h>
 #include <linux/wait.h>
 
+#include <asm/apic.h>
 #include <asm/current.h>
 #include <asm/cpu_entry_area.h>
 #include <asm/desc.h>
@@ -172,10 +175,17 @@ static void sev_snapshot_notify_vmpl0_page_state_pa(u64 gpa, u64 npages,
 		if (WARN_ON_ONCE(gfn > U32_MAX))
 			break;
 
-		notify = SEV_SNAPSHOT_SHARED_STATE_NOTIFY_VALUE |
-			 ((u64)op << 52) |
-			 ((chunk - 1) << 44) |
-			 (gfn << PAGE_SHIFT);
+		if (op == SNP_PAGE_STATE_SHARED && npages >= PMD_SIZE / PAGE_SIZE &&
+		    swiotlb_is_hugepage_range(gpa, PMD_SIZE)) {
+			/* Both VMPL0 firmwares accept a full 2 MiB raw PSC. */
+			chunk = PMD_SIZE / PAGE_SIZE;
+			notify = GHCB_MSR_PSC_REQ_GFN(gfn, op) | BIT_ULL(63);
+		} else {
+			notify = SEV_SNAPSHOT_SHARED_STATE_NOTIFY_VALUE |
+				 ((u64)op << 52) |
+				 ((chunk - 1) << 44) |
+				 (gfn << PAGE_SHIFT);
+		}
 		native_wrmsrl(MSR_AMD64_SEV_ES_GHCB, notify);
 		VMGEXIT();
 
@@ -254,6 +264,19 @@ static bool sev_snapshot_single_vcpu_online(void)
 	return cpu_online(0);
 }
 
+static int sev_snapshot_refresh_wall_clock(void)
+{
+	struct timespec64 current_time;
+	struct timespec64 host_time;
+
+	/* Match the helper continuation before time-sensitive network requests. */
+	read_persistent_clock64(&host_time);
+	ktime_get_real_ts64(&current_time);
+	if (timespec64_compare(&host_time, &current_time) > 0)
+		return do_settimeofday64(&host_time);
+	return 0;
+}
+
 static long sev_snapshot_capture_vmpl_vmsa_primary(void)
 {
 	long ret;
@@ -278,9 +301,16 @@ static long sev_snapshot_capture_vmpl_vmsa_primary(void)
 	 */
 	sev_snapshot_register_runtime_ghcb_cpu(0);
 	kvm_sev_faasev_reinit();
+	/* The new Template LAPIC is not part of the restored VMSA. */
+	apic_ap_setup();
 	tick_resume_local();
 	local_irq_enable();
 	preempt_enable();
+	ret = sev_snapshot_refresh_wall_clock();
+	if (ret) {
+		sev_snapshot_abort_capture_setup();
+		return ret;
+	}
 	ret = sev_snapshot_install_input_private_key();
 	if (ret) {
 		sev_snapshot_abort_capture_setup();
