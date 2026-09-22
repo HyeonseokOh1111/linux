@@ -360,8 +360,8 @@ static int kvm_faasev_memory_fast_show(struct seq_file *m, void *v)
 				gfn_t gfn = slot->base_gfn + ((addr - start) >> PAGE_SHIFT);
 				gfn_t last = gfn + ((next - addr) >> PAGE_SHIFT);
 
-				/* Workload's only small RAM region is GPA [0, 2 MiB). */
-				if (last > PMD_SIZE / PAGE_SIZE) {
+				/* Template control HVA extends small RAM to GPA 4 MiB. */
+				if (last > 2 * PMD_SIZE / PAGE_SIZE) {
 					err = -EOPNOTSUPP;
 					goto out;
 				}

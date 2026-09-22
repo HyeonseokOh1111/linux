@@ -3032,8 +3032,26 @@ void sev_vm_destroy(struct kvm *kvm)
 		}
 	} else {
 		sev_unbind_asid(kvm, sev->handle);
+		sev_asid_free(sev);
 	}
+}
 
+void sev_vm_free(struct kvm *kvm)
+{
+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+
+	if (!sev_snp_guest(kvm) || is_mirroring_enc_context(kvm))
+		return;
+
+	/* Keep the ASID reserved if decommissioning the context failed. */
+	if (sev->snp_context)
+		return;
+
+	/*
+	 * SNP_ACTIVATE rejects an ASID while any RMP page still belongs to it.
+	 * sev_vm_destroy() precedes VMSA and restrictedmem reclamation, so only
+	 * make the ASID recyclable after both have finished in kvm_destroy_vm().
+	 */
 	sev_asid_free(sev);
 }
 

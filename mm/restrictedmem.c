@@ -10,12 +10,14 @@
 #include <uapi/linux/magic.h>
 #include <linux/restrictedmem.h>
 #include <linux/hugetlb.h>
+#include <linux/sizes.h>
 
 struct restrictedmem {
 	struct rw_semaphore lock;
 	struct file *memfd;
 	struct xarray bindings;
 	bool exclusive;
+	bool low_4k;
 };
 
 static int restrictedmem_release(struct inode *inode, struct file *file)
@@ -144,7 +146,7 @@ static __init int restrictedmem_init(void)
 }
 fs_initcall(restrictedmem_init);
 
-static struct file *restrictedmem_file_create(struct file *memfd)
+static struct file *restrictedmem_file_create(struct file *memfd, bool low_4k)
 {
 	struct restrictedmem *rm;
 	struct address_space *mapping;
@@ -156,6 +158,7 @@ static struct file *restrictedmem_file_create(struct file *memfd)
 		return ERR_PTR(-ENOMEM);
 
 	rm->memfd = memfd;
+	rm->low_4k = low_4k;
 	init_rwsem(&rm->lock);
 	xa_init(&rm->bindings);
 
@@ -242,7 +245,8 @@ SYSCALL_DEFINE1(memfd_restricted, unsigned int, flags)
 	struct file *file, *restricted_file;
 	int fd, err;
 
-	if (flags & ~RESTRICTEDMEM_HUGETLB)
+	if (flags & ~(RESTRICTEDMEM_HUGETLB | RESTRICTEDMEM_LOW_4K) ||
+	    flags == (RESTRICTEDMEM_HUGETLB | RESTRICTEDMEM_LOW_4K))
 		return -EINVAL;
 
 	fd = get_unused_fd_flags(0);
@@ -263,7 +267,7 @@ SYSCALL_DEFINE1(memfd_restricted, unsigned int, flags)
 
 	file->f_mapping->a_ops = &restricted_aops;
 
-	restricted_file = restrictedmem_file_create(file);
+	restricted_file = restrictedmem_file_create(file, flags & RESTRICTEDMEM_LOW_4K);
 	if (IS_ERR(restricted_file)) {
 		err = PTR_ERR(restricted_file);
 		fput(file);
@@ -376,7 +380,9 @@ int restrictedmem_get_page(struct file *file, pgoff_t offset,
 		return restrictedmem_get_hugetlb_page(memfd, offset, pagep,
 						    order, true);
 
-	ret = shmem_get_folio(file_inode(memfd), offset, &folio, SGP_WRITE);
+	ret = shmem_get_folio(file_inode(memfd), offset, &folio,
+			     rm->low_4k && offset < (SZ_2M >> PAGE_SHIFT) ?
+			     SGP_WRITE_NOHUGE : SGP_WRITE);
 	if (ret)
 		return ret;
 

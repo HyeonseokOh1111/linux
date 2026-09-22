@@ -8,6 +8,8 @@
 
 ## Memory and fault contract
 
+- 모든 실험의 GPA `[0,2 MiB)` private backing은 `memfd_restricted(RESTRICTEDMEM_LOW_4K)`로 shmem THP 정책과 무관하게 4 KiB 단위로 demand allocation한다. 이 flag는 private file offset이 GPA와 같은 첫 memslot에 적용하며, 같은 file의 2 MiB 이상 영역은 기존 THP 정책을 유지한다. 별도 HugeTLB file은 기존 HugeTLB 경로를 유지한다. `RESTRICTEDMEM_LOW_4K`와 `RESTRICTEDMEM_HUGETLB`를 함께 지정하지 않는다. Host의 전역 THP 설정을 꺼서 이 정책을 구현하지 않는다.
+
 - `memfd_restricted(RESTRICTEDMEM_HUGETLB)`는 workload에서만 사용하는 opt-in 경로다. 2 MiB HugeTLB backing은 요청된 페이지에 대해 demand allocation하며 전체 file 크기를 선예약하지 않는다. HugeTLB cache index와 KVM의 4 KiB page offset을 변환하고, 기존 invalidation·migration 금지·RMP 해제를 유지한다. Pool 부족 시 shmem fallback하지 않는다. 이 지원은 built-in `mm/restrictedmem.c`에 있으므로 KVM 모듈 재로드만으로 적용할 수 없다.
 
 - 일반 memory-attribute 변경은 이미 존재하는 restrictedmem page에만 적용하고 sparse range 전체를 즉시 materialize하지 않는다. 실제 RMP fault나 PSC가 요청한 page만 demand allocation한다.
@@ -28,6 +30,6 @@
 
 ## Workload memory accounting
 
-- `faasev_memory_backing_fast`는 HugeTLB workload의 실제 restricted backing과 HVA backing을 집계한다. Process의 HugeTLB VMA가 겹치지 않는 guest RAM memslot에만 속하는지 확인한 뒤 기존 `mm->hugetlb_usage`를 사용하고, GPA `[0,2 MiB)`의 작은 backing만 별도로 조회한다. 전체 RAM 순회나 VM 정지를 주기 수집에 넣지 않는다.
+- `faasev_memory_backing_fast`는 HugeTLB workload의 실제 restricted backing과 HVA backing을 집계한다. Process의 HugeTLB VMA가 겹치지 않는 guest RAM memslot에만 속하는지 확인한 뒤 기존 `mm->hugetlb_usage`를 사용하고, 작은 backing만 별도로 조회한다. 작은 영역은 Template의 control/shared HVA를 포함한 GPA `[0,4 MiB)`, SEVeriFast는 `[0,2 MiB)`다. 전체 RAM 순회나 VM 정지를 주기 수집에 넣지 않는다.
 - `faasev_memory_backing_bytes`의 상세 조회는 측정 전 검증에 사용한다. 실제 restricted page와 HVA page를 열거해 allocation counter와 대조하고 물리 PFN 중복을 보고한다. 이 상세 검사를 본 workload의 주기 수집에서 호출하지 않는다.
 - Private/shared 상태만 바뀌고 backing이 남아 있으면 실제 점유량에 계속 포함한다. Pool 잔여 사용량과 VM별 집계의 차이를 누락하거나 자동으로 누수라고 단정하지 않는다.

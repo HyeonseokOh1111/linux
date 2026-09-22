@@ -1828,6 +1828,7 @@ static int shmem_get_folio_gfp(struct inode *inode, pgoff_t index,
 		struct vm_area_struct *vma, struct vm_fault *vmf,
 		vm_fault_t *fault_type)
 {
+	bool nohuge = sgp == SGP_WRITE_NOHUGE;
 	struct address_space *mapping = inode->i_mapping;
 	struct shmem_inode_info *info = SHMEM_I(inode);
 	struct shmem_sb_info *sbinfo;
@@ -1838,6 +1839,9 @@ static int shmem_get_folio_gfp(struct inode *inode, pgoff_t index,
 	int error;
 	int once = 0;
 	int alloced = 0;
+
+	if (nohuge)
+		sgp = SGP_WRITE;
 
 	if (index > (MAX_LFS_FILESIZE >> PAGE_SHIFT))
 		return -EFBIG;
@@ -1902,7 +1906,7 @@ repeat:
 		return 0;
 	}
 
-	if (!shmem_is_huge(vma, inode, index, false))
+	if (nohuge || !shmem_is_huge(vma, inode, index, false))
 		goto alloc_nohuge;
 
 	huge_gfp = vma_thp_gfp_mask(vma);

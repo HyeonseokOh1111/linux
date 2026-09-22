@@ -12178,6 +12178,8 @@ void kvm_arch_sched_in(struct kvm_vcpu *vcpu, int cpu)
 
 void kvm_arch_free_vm(struct kvm *kvm)
 {
+	/* All vCPUs and private memory slots have been released. */
+	static_call_cond(kvm_x86_vm_free)(kvm);
 	kfree(to_kvm_hv(kvm)->hv_pa_pg);
 	__kvm_arch_free_vm(kvm);
 }

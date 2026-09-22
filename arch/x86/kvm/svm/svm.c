@@ -4769,6 +4769,7 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
 	.vm_size = sizeof(struct kvm_svm),
 	.vm_init = svm_vm_init,
 	.vm_destroy = svm_vm_destroy,
+	.vm_free = sev_vm_free,
 
 	.prepare_switch_to_guest = svm_prepare_switch_to_guest,
 	.vcpu_load = svm_vcpu_load,

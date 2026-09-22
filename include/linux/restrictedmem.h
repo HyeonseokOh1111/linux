@@ -8,6 +8,8 @@
 
 /* memfd_restricted(): demand-allocate 2 MiB pages from the HugeTLB pool. */
 #define RESTRICTEDMEM_HUGETLB (1U << 0)
+/* Keep file offsets [0, 2 MiB) on base pages, independently of shmem THP. */
+#define RESTRICTEDMEM_LOW_4K (1U << 1)
 
 struct restrictedmem_notifier;
 

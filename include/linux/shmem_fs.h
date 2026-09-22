@@ -111,6 +111,7 @@ enum sgp_type {
 	SGP_CACHE,	/* don't exceed i_size, may allocate page */
 	SGP_WRITE,	/* may exceed i_size, may allocate !Uptodate page */
 	SGP_FALLOC,	/* like SGP_WRITE, but make existing page Uptodate */
+	SGP_WRITE_NOHUGE, /* SGP_WRITE without allocating a huge folio */
 };
 
 int shmem_get_folio(struct inode *inode, pgoff_t index, struct folio **foliop,
