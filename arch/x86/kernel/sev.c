@@ -9,6 +9,7 @@
 
 #define pr_fmt(fmt)	"SEV: " fmt
 
+#include <asm/faasev_service.h>
 #include <linux/sched/debug.h>	/* For show_regs() */
 #include <linux/percpu-defs.h>
 #include <linux/init.h>
@@ -87,32 +88,16 @@ bool faasev_vmpl_boot_early __section(".data");
 
 #define FAASEV_SHADOW_CRYPTO_DECRYPT	0
 #define FAASEV_SHADOW_CRYPTO_ENCRYPT	1
-#define SVM_VMGEXIT_FAASEV_VMPL0_SERVICE	0x8000fa05ULL
-#define FAASEV_VMPL0_SERVICE_OP_PVALIDATE	1
-#define FAASEV_VMPL0_SERVICE_STATUS_PENDING	1
-#define FAASEV_VMPL0_SERVICE_STATUS_OK		2
-#define FAASEV_VMPL0_SERVICE_PVALIDATE_VALIDATE	BIT(0)
 #define FAASEV_SHADOW_CRYPTO_RECORD_SIZE	512
 #define FAASEV_SHADOW_CRYPTO_TAG_LEN		16
 #define FAASEV_SHADOW_CRYPTO_IV_LEN		12
 #define FAASEV_SHADOW_CRYPTO_KEY_LEN		16
 #define FAASEV_INPUT_PRIVATE_KEY_LEN		32
 #define FAASEV_SINGLE_KERNEL_BASE		0x01000000UL
-#define FAASEV_SINGLE_MAILBOX_BASE		0x00e00000UL
 #define FAASEV_PRIVATE_MAILBOX_SIZE		0x00200000UL
 #define FAASEV_SINGLE_SERVICE_CPU_COUNT		1
 #define FAASEV_SHADOW_CRYPTO_BUFFER_LEN		\
 	(FAASEV_SHADOW_CRYPTO_RECORD_SIZE + FAASEV_SHADOW_CRYPTO_TAG_LEN)
-
-struct faasev_vmpl0_service_page {
-	u32 opcode;
-	u32 status;
-	struct {
-		u64 gpa;
-		u32 npages;
-		u32 flags;
-	} __packed pvalidate;
-} __packed;
 
 static int faasev_vmpl0_service_pvalidate_pages(unsigned long vaddr,
 						unsigned int npages,
@@ -639,55 +624,16 @@ static noinstr void __sev_put_ghcb(struct ghcb_state *state)
 	}
 }
 
-static int faasev_vmpl0_service_status_to_errno(u32 status)
-{
-	if (status == FAASEV_VMPL0_SERVICE_STATUS_OK)
-		return 0;
-	if (!status || status == FAASEV_VMPL0_SERVICE_STATUS_PENDING)
-		return -EIO;
-	if (status < 4096)
-		return -(int)status;
-	return -EIO;
-}
-
 static int faasev_vmpl0_service_call_locked(struct faasev_vmpl0_service_page *svc)
 {
-	struct ghcb_state state;
-	struct es_em_ctxt ctxt = {};
-	struct ghcb *ghcb;
-	enum es_result res;
-	int ret;
+	u64 saved;
 
 	WARN_ON(!irqs_disabled());
-
-	ghcb = __sev_get_ghcb(&state);
-	if (!ghcb) {
-		ret = -EIO;
-		goto out_zero;
-	}
-
-	vc_ghcb_invalidate(ghcb);
-
-	/*
-	 * Do not place service operands in the GHCB.  The shared GHCB page
-	 * carries only a userspace-routed service exit code; VMPL0 derives the
-	 * private service page from the CPU's fixed mailbox offset and reads
-	 * operands there.
-	 */
-	barrier();
-	res = sev_es_ghcb_hv_call(ghcb, &ctxt,
-				  SVM_VMGEXIT_FAASEV_VMPL0_SERVICE, 0, 0);
-	barrier();
-
-	__sev_put_ghcb(&state);
-	if (res != ES_OK) {
-		ret = -EIO;
-		goto out_zero;
-	}
-	ret = faasev_vmpl0_service_status_to_errno(svc->status);
-
-out_zero:
-	return ret;
+	saved = __rdmsr(MSR_AMD64_SEV_ES_GHCB);
+	native_wrmsrl(MSR_AMD64_SEV_ES_GHCB, FAASEV_SERVICE_DOORBELL);
+	VMGEXIT();
+	native_wrmsrl(MSR_AMD64_SEV_ES_GHCB, saved);
+	return faasev_service_finish(svc) ? 0 : -EIO;
 }
 
 static int faasev_vmpl0_service_submit_pvalidate(phys_addr_t gpa,
@@ -716,15 +662,12 @@ static int faasev_vmpl0_service_submit_pvalidate(phys_addr_t gpa,
 		ret = -EINVAL;
 		goto out_unlock;
 	}
-	memset(svc, 0, sizeof(*svc));
-	svc->opcode = FAASEV_VMPL0_SERVICE_OP_PVALIDATE;
-	svc->status = FAASEV_VMPL0_SERVICE_STATUS_PENDING;
-	svc->pvalidate.gpa = gpa;
-	svc->pvalidate.npages = npages;
-	svc->pvalidate.flags = validate ? FAASEV_VMPL0_SERVICE_PVALIDATE_VALIDATE : 0;
-
+	if (!faasev_service_publish(svc, validate ? FAASEV_SERVICE_MAKE_PRIVATE :
+				    FAASEV_SERVICE_MAKE_SHARED, gpa, npages)) {
+		ret = -EIO;
+		goto out_unlock;
+	}
 	ret = faasev_vmpl0_service_call_locked(svc);
-	memzero_explicit(svc, sizeof(*svc));
 
 out_unlock:
 	local_irq_restore(flags);
@@ -1852,7 +1795,7 @@ static void __init init_ghcb(int cpu)
 		/* Recorder prepared this private RW page before entering VMPL1. */
 		if (cpu >= FAASEV_SINGLE_SERVICE_CPU_COUNT)
 			panic("FaaSEV Single supports only vCPU0");
-		memset(__va(faasev_single_service_gpa(cpu)), 0, PAGE_SIZE);
+		/* Preserve the private request sequence established during early boot. */
 	}
 
 	data->ghcb_active = false;
@@ -1865,10 +1808,10 @@ void __init sev_es_init_vc_handling(void)
 
 	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, ghcb_page) % PAGE_SIZE);
 	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, backup_ghcb) != PAGE_SIZE);
-	BUILD_BUG_ON(sizeof(struct faasev_vmpl0_service_page) != 24);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page, opcode) != 0);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page, status) != 4);
-	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page, pvalidate) != 8);
+	BUILD_BUG_ON(sizeof(struct faasev_vmpl0_service_page) != 32);
+	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page, opcode) != 8);
+	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page, status) != 12);
+	BUILD_BUG_ON(offsetof(struct faasev_vmpl0_service_page, gpa) != 16);
 
 	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
 		return;

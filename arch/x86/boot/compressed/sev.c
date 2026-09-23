@@ -10,6 +10,7 @@
  * headers in the pre-decompression code in a way that does not break
  * compilation.
  */
+#include <asm/faasev_service.h>
 #include "misc.h"
 
 #include <asm/pgtable_types.h>
@@ -136,26 +137,28 @@ bool faasev_vmpl_requested(void)
 	return faasev_vmpl_boot;
 }
 
-void faasev_prepare_private_pages(unsigned long paddr, unsigned long npages)
+static void faasev_service_submit(unsigned long paddr, unsigned long npages, u32 opcode)
 {
-	const u64 request = 0xf500000000000014ULL | (3ULL << 52);
+	struct faasev_vmpl0_service_page *svc = (void *)FAASEV_SERVICE_GPA;
 	struct msr saved;
 
 	if (!faasev_vmpl_requested() || !npages)
 		return;
-
+	if (npages > U32_MAX)
+		error("private page-state request is too large");
 	boot_rdmsr(MSR_AMD64_SEV_ES_GHCB, &saved);
-	while (npages) {
-		u64 chunk = min(npages, 256UL);
-		u64 notify = request | ((chunk - 1) << 44) |
-				     ((paddr >> PAGE_SHIFT) << PAGE_SHIFT);
-
-		sev_es_wr_ghcb_msr(notify);
-		VMGEXIT();
-		paddr += chunk << PAGE_SHIFT;
-		npages -= chunk;
-	}
+	if (!faasev_service_publish(svc, opcode, paddr, npages))
+		error("private page-state sequence exhausted or busy");
+	sev_es_wr_ghcb_msr(FAASEV_SERVICE_DOORBELL);
+	VMGEXIT();
 	sev_es_wr_ghcb_msr(saved.q);
+	if (!faasev_service_finish(svc))
+		error("VMPL0 rejected private page-state request");
+}
+
+void faasev_prepare_private_pages(unsigned long paddr, unsigned long npages)
+{
+	faasev_service_submit(paddr, npages, FAASEV_SERVICE_PREPARE_PRIVATE);
 }
 
 static void __page_state_change(unsigned long paddr, enum psc_op op)
@@ -165,14 +168,11 @@ static void __page_state_change(unsigned long paddr, enum psc_op op)
 	if (!sev_snp_enabled())
 		return;
 
-	/*
-	 * In the VMPL path, VMPL0 owns private-page acceptance and lower-VMPL
-	 * permission grants. A compressed-boot private PSC from VMPL1 can clear
-	 * those grants before the main kernel can install VMPL0-mediated page
-	 * state tracking.
-	 */
-	if (faasev_vmpl_requested())
+	if (faasev_vmpl_requested()) {
+		faasev_service_submit(paddr, 1, op == SNP_PAGE_STATE_SHARED ?
+				      FAASEV_SERVICE_MAKE_SHARED : FAASEV_SERVICE_MAKE_PRIVATE);
 		return;
+	}
 
 	/*
 	 * If private -> shared then invalidate the page before requesting the

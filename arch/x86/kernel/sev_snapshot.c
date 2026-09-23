@@ -9,6 +9,7 @@
 
 #define pr_fmt(fmt) "SEV: " fmt
 
+#include <asm/faasev_service.h>
 #include <linux/bug.h>
 #include <linux/cpu.h>
 #include <linux/delay.h>
@@ -66,8 +67,6 @@
 #include "sev_snapshot.h"
 
 #define SEV_SNAPSHOT_REQUEST_HOST_EVENT_SIGNAL	0x0051000000000014ULL
-#define SEV_SNAPSHOT_SHARED_STATE_NOTIFY_VALUE	0xf500000000000014ULL
-#define SEV_SNAPSHOT_SHARED_STATE_NOTIFY_MAX_RUN_PAGES	256UL
 #define SEV_SNAPSHOT_PAGE_PREPARE_PRIVATE	3
 
 static cpumask_t sev_snapshot_saved_cpus_allowed;
@@ -152,47 +151,35 @@ int sev_snapshot_faasev_virtio_devices(void)
 	return ret;
 }
 
-static void sev_snapshot_notify_vmpl0_page_state_pa(u64 gpa, u64 npages,
-						    u64 op)
+static void sev_snapshot_notify_vmpl0_page_state_pa(u64 gpa, u64 npages, u64 op)
 {
+	struct faasev_vmpl0_service_page *svc = __va(FAASEV_SERVICE_GPA);
 	unsigned long flags;
-	u64 ghcb_msr;
+	u64 saved;
+	u32 opcode;
 
 	if (!faasev_vmpl_boot_early || !npages)
 		return;
-	if (op != SNP_PAGE_STATE_SHARED && op != SNP_PAGE_STATE_PRIVATE &&
-	    op != SEV_SNAPSHOT_PAGE_PREPARE_PRIVATE)
-		return;
+	if (op == SNP_PAGE_STATE_SHARED)
+		opcode = FAASEV_SERVICE_MAKE_SHARED;
+	else if (op == SNP_PAGE_STATE_PRIVATE)
+		opcode = FAASEV_SERVICE_MAKE_PRIVATE;
+	else if (op == SEV_SNAPSHOT_PAGE_PREPARE_PRIVATE)
+		opcode = FAASEV_SERVICE_PREPARE_PRIVATE;
+	else
+		panic("invalid private page-state request");
+	if (npages > U32_MAX || raw_smp_processor_id() != 0)
+		panic("unsupported private page-state caller or range");
 
 	local_irq_save(flags);
-	ghcb_msr = __rdmsr(MSR_AMD64_SEV_ES_GHCB);
-	while (npages) {
-		u64 chunk = min_t(u64, npages,
-				  SEV_SNAPSHOT_SHARED_STATE_NOTIFY_MAX_RUN_PAGES);
-		u64 gfn = gpa >> PAGE_SHIFT;
-		u64 notify;
-
-		if (WARN_ON_ONCE(gfn > U32_MAX))
-			break;
-
-		if (op == SNP_PAGE_STATE_SHARED && npages >= PMD_SIZE / PAGE_SIZE &&
-		    swiotlb_is_hugepage_range(gpa, PMD_SIZE)) {
-			/* Both VMPL0 firmwares accept a full 2 MiB raw PSC. */
-			chunk = PMD_SIZE / PAGE_SIZE;
-			notify = GHCB_MSR_PSC_REQ_GFN(gfn, op) | BIT_ULL(63);
-		} else {
-			notify = SEV_SNAPSHOT_SHARED_STATE_NOTIFY_VALUE |
-				 ((u64)op << 52) |
-				 ((chunk - 1) << 44) |
-				 (gfn << PAGE_SHIFT);
-		}
-		native_wrmsrl(MSR_AMD64_SEV_ES_GHCB, notify);
-		VMGEXIT();
-
-		gpa += chunk << PAGE_SHIFT;
-		npages -= chunk;
-	}
-	native_wrmsrl(MSR_AMD64_SEV_ES_GHCB, ghcb_msr);
+	saved = __rdmsr(MSR_AMD64_SEV_ES_GHCB);
+	if (!faasev_service_publish(svc, opcode, gpa, npages))
+		panic("private page-state sequence exhausted or busy");
+	native_wrmsrl(MSR_AMD64_SEV_ES_GHCB, FAASEV_SERVICE_DOORBELL);
+	VMGEXIT();
+	native_wrmsrl(MSR_AMD64_SEV_ES_GHCB, saved);
+	if (!faasev_service_finish(svc))
+		panic("VMPL0 rejected private page-state request");
 	local_irq_restore(flags);
 }
 

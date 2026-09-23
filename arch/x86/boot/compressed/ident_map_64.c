@@ -1,3 +1,4 @@
+#include <asm/faasev_service.h>
 // SPDX-License-Identifier: GPL-2.0
 /*
  * This code is used on x86_64 to create page table identity mappings on
@@ -155,6 +156,8 @@ void initialize_identity_maps(void *rmode)
 	kernel_add_identity_map((unsigned long)boot_params, (unsigned long)(boot_params + 1));
 	cmdline = get_cmd_line_ptr();
 	kernel_add_identity_map(cmdline, cmdline + COMMAND_LINE_SIZE);
+	if (faasev_vmpl_requested())
+		kernel_add_identity_map(FAASEV_SERVICE_GPA, FAASEV_SERVICE_GPA + PAGE_SIZE);
 
 	/*
 	 * Also map the setup_data entries passed via boot_params in case they

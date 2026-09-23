@@ -10,6 +10,7 @@
 /* cpu_feature_enabled() cannot be used this early */
 #define USE_EARLY_PGTABLE_L5
 
+#include <asm/faasev_service.h>
 #include <linux/init.h>
 #include <linux/linkage.h>
 #include <linux/types.h>
@@ -133,20 +134,17 @@ static void __head faasev_prepare_early_shared_range(unsigned long paddr,
 	asm volatile("rdmsr"
 		     : "=a"(saved_lo), "=d"(saved_hi)
 		     : "c"(MSR_AMD64_SEV_ES_GHCB));
-	while (npages) {
-		u64 chunk = npages > 256 ? 256 : npages;
-		u64 request = 0xf500000000000014ULL | (2ULL << 52) |
-				      ((chunk - 1) << 44) |
-				      ((paddr >> PAGE_SHIFT) << PAGE_SHIFT);
+	{
+		struct faasev_vmpl0_service_page *svc = (void *)FAASEV_SERVICE_GPA;
+		u64 request = FAASEV_SERVICE_DOORBELL;
 
-		asm volatile("wrmsr\n\t"
-			     "rep; vmmcall"
-			     :
-			     : "c"(MSR_AMD64_SEV_ES_GHCB),
-			       "a"((u32)request), "d"((u32)(request >> 32))
-			     : "memory");
-		paddr += chunk << PAGE_SHIFT;
-		npages -= chunk;
+		if (!faasev_service_publish(svc, FAASEV_SERVICE_MAKE_SHARED, paddr, npages))
+			for (;;) asm volatile("hlt");
+		asm volatile("wrmsr\n\trep; vmmcall"
+			     : : "c"(MSR_AMD64_SEV_ES_GHCB),
+			     "a"((u32)request), "d"((u32)(request >> 32)) : "memory");
+		if (!faasev_service_finish(svc))
+			for (;;) asm volatile("hlt");
 	}
 	if (saved_lo & 0xfff) {
 		saved_lo = 0;

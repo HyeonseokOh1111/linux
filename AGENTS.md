@@ -46,3 +46,5 @@
 - Lower-VMPL missing-page `#VC`는 Linux에서 `PVALIDATE`하거나 payload를 설치하지 않고 같은 instruction을 재시도한다. Host lazy page installation 순서는 `../firecracker/AGENTS.md`의 Lazy page installation 및 `../snapshot-restorer/AGENTS.md`의 FaaSEV contract를 따른다.
 - FaaSEV continuation에서 clock, KVM per-vCPU state, tick과 IRQ stack은 표준 kernel helper를 사용해 복구하며 수동 LAPIC programming, broad PV reinitialization과 multi-vCPU/AP 복구 helper를 추가하지 않는다.
 - Syscall table, header, build wiring과 producer/consumer ABI 선언은 해당 기능과 함께 변경하고 사용되지 않는 entry, offset과 include를 남기지 않는다.
+
+- Compressed boot·head64·runtime은 같은 `asm/faasev_service.h`의 32-byte private request와 단조 증가 sequence를 사용한다. 고정 doorbell에는 GPA·page count·operation을 넣지 않는다. Success 후 요청 fields를 지우되 sequence는 보존하고 GHCB 초기화 때 service page를 reset하지 않는다.
