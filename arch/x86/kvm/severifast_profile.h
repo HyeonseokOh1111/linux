@@ -8,6 +8,8 @@
 /* Optional per-VM motivation measurements. One bit per 2 MiB or 4 KiB. */
 struct severifast_profile {
 	atomic64_t rmp_ns;
+// FAASEV_EVAL_DISABLED 	atomic64_t rmp_shared_ns;
+// FAASEV_EVAL_DISABLED 	atomic64_t psmash_ns;
 	atomic64_t rmp_4k;
 	atomic64_t rmp_2m;
 	unsigned int phase;

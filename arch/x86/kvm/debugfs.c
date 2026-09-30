@@ -465,6 +465,8 @@ static int severifast_profile_show(struct seq_file *m, void *v)
 	seq_printf(m, "rmp_ns %lld\nrmp_4k %lld\nrmp_2m %lld\n",
 		   atomic64_read(&p->rmp_ns), atomic64_read(&p->rmp_4k),
 		   atomic64_read(&p->rmp_2m));
+// FAASEV_EVAL_DISABLED 	seq_printf(m, "rmp_shared_ns %lld\npsmash_ns %lld\n",
+// FAASEV_EVAL_DISABLED 		   atomic64_read(&p->rmp_shared_ns), atomic64_read(&p->psmash_ns));
 	if (p->access[0] && !p->phase) {
 		for (i = 0; i < p->bins; i++)
 			seq_printf(m, "access%s %lu %d %d\n", p->access_shift ? "" : "4k", i,

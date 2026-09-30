@@ -3683,6 +3683,18 @@ static void set_ghcb_msr(struct vcpu_svm *svm, u64 value)
 	svm->vmcb->control.ghcb_gpa = value;
 }
 
+// FAASEV_EVAL_DISABLED static int snp_rmptable_psmash(struct kvm *kvm, kvm_pfn_t pfn)
+// FAASEV_EVAL_DISABLED {
+// FAASEV_EVAL_DISABLED 	struct severifast_profile *p = READ_ONCE(kvm->arch.severifast_profile);
+// FAASEV_EVAL_DISABLED 	u64 begin = p ? ktime_get_ns() : 0;
+// FAASEV_EVAL_DISABLED 	int ret;
+// FAASEV_EVAL_DISABLED 	pfn = pfn & ~(KVM_PAGES_PER_HPAGE(PG_LEVEL_2M) - 1);
+
+// FAASEV_EVAL_DISABLED 	ret = psmash(pfn);
+// FAASEV_EVAL_DISABLED 	if (p)
+// FAASEV_EVAL_DISABLED 		atomic64_add(ktime_get_ns() - begin, &p->psmash_ns);
+// FAASEV_EVAL_DISABLED 	return ret;
+// FAASEV_EVAL_DISABLED }
 static int snp_rmptable_psmash(struct kvm *kvm, kvm_pfn_t pfn)
 {
 	pfn = pfn & ~(KVM_PAGES_PER_HPAGE(PG_LEVEL_2M) - 1);
@@ -3692,6 +3704,8 @@ static int snp_rmptable_psmash(struct kvm *kvm, kvm_pfn_t pfn)
 
 static int snp_make_page_shared(struct kvm *kvm, gpa_t gpa, kvm_pfn_t pfn, int level)
 {
+// FAASEV_EVAL_DISABLED 	struct severifast_profile *p = READ_ONCE(kvm->arch.severifast_profile);
+// FAASEV_EVAL_DISABLED 	u64 begin;
 	int rc, rmp_level;
 
 	rc = snp_lookup_rmpentry(pfn, &rmp_level);
@@ -3712,6 +3726,11 @@ static int snp_make_page_shared(struct kvm *kvm, gpa_t gpa, kvm_pfn_t pfn, int l
 			return rc;
 	}
 
+// FAASEV_EVAL_DISABLED 	begin = p ? ktime_get_ns() : 0;
+// FAASEV_EVAL_DISABLED 	rc = rmp_make_shared(pfn, level);
+// FAASEV_EVAL_DISABLED 	if (p)
+// FAASEV_EVAL_DISABLED 		atomic64_add(ktime_get_ns() - begin, &p->rmp_shared_ns);
+// FAASEV_EVAL_DISABLED 	return rc;
 	return rmp_make_shared(pfn, level);
 }
 
