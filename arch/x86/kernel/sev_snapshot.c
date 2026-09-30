@@ -23,6 +23,7 @@
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/string.h>
+#include <linux/timekeeping.h>
 #include <linux/tick.h>
 #include <linux/uaccess.h>
 #include <linux/virtio.h>
@@ -691,10 +692,32 @@ sev_snapshot_restore_barrier(void *mailbox, u32 cpu_count)
 		((u8 *)mailbox + sev_snapshot_restore_barrier_offset(cpu_count));
 }
 
+static noinline void sev_snapshot_refresh_wall_clock(void)
+{
+	struct timespec64 current_time;
+	struct timespec64 host_time;
+
+	/*
+	 * The restored timekeeper contains the wall clock from snapshot capture.
+	 * Read Firecracker's current RTC before returning to userspace so protocols
+	 * such as AWS SigV4 do not observe the Template's parked interval as clock
+	 * skew.  Preserve a guest clock that is already ahead instead of moving it
+	 * backwards.
+	 */
+	read_persistent_clock64(&host_time);
+	ktime_get_real_ts64(&current_time);
+	if (timespec64_compare(&host_time, &current_time) > 0 &&
+	    do_settimeofday64(&host_time))
+		sev_snapshot_restore_fault();
+}
+
 static void sev_snapshot_finish_bsp_restore(void)
 {
 	u32 restore_cpu_count = sev_snapshot_restore_cpu_count();
 	void *mailbox = sev_snapshot_restore_mailbox_va();
+
+	/* Keep stack locals out of the software checkpoint's register window. */
+	sev_snapshot_refresh_wall_clock();
 
 	if (sev_snapshot_install_input_private_key())
 		sev_snapshot_restore_fault();
